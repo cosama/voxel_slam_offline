@@ -23,7 +23,9 @@ The vendored upstream reference is
 
 ## License
 
-This package follows upstream Voxel-SLAM and is licensed under GPL-2.0-only.
+This package is licensed under GPL-2.0-only because it contains and links
+against upstream HKU-MARS Voxel-SLAM code. If this creates a practical issue
+for your use case, please reach out so we can discuss options.
 
 ## Minimal Usage
 
