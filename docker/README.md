@@ -29,3 +29,11 @@ Publishable image name for GitHub Container Registry:
 ```bash
 ghcr.io/<user-or-org>/voxel-slam-offline:<tag>
 ```
+
+The GitHub Actions workflow builds pull requests without pushing and publishes
+on pushes to `main`, tags matching `v*`, and manual dispatches. For this
+repository the published image is:
+
+```bash
+ghcr.io/cosama/voxel_slam_offline:<tag>
+```
