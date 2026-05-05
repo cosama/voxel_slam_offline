@@ -6,8 +6,12 @@ build-backend = "scikit_build_core.build"
 name = "voxel-slam-offline"
 version = "0.1.0"
 description = "ROS-free offline Python bindings for Voxel-SLAM"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+]
 
 [project.optional-dependencies]
 runner = ["plyfile>=0.9", "rosbags>=0.10"]

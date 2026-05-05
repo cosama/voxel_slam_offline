@@ -21,6 +21,10 @@ The vendored upstream reference is
 [hku-mars/Voxel-SLAM](https://github.com/hku-mars/Voxel-SLAM) at commit
 `70fc8a28d63823d5989ff184daeea0787b672398`.
 
+## License
+
+This package follows upstream Voxel-SLAM and is licensed under GPL-2.0-only.
+
 ## Minimal Usage
 
 ```python
