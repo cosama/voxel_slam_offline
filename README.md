@@ -17,7 +17,8 @@ parameters. Build those inputs outside the package and pass plain Python data.
   times in seconds. If a source header represents the end of a sweep, call
   `push_lidar(..., stamp_is_end=True)`.
 
-The vendored upstream reference is based on commit
+The vendored upstream reference is
+[hku-mars/Voxel-SLAM](https://github.com/hku-mars/Voxel-SLAM) at commit
 `70fc8a28d63823d5989ff184daeea0787b672398`.
 
 ## Minimal Usage
