@@ -4,6 +4,8 @@
 #include "tools.hpp"
 #include "voxel_map.hpp"
 
+#include <voxelslam/offline_bridge.hpp>
+
 // #include "STDesc.h"
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -138,8 +140,10 @@ bool icp_normal(pcl::PointCloud<PointType> &pl_src, pcl::PointCloud<PointType> &
 
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(mat_norm);
   Eigen::Vector3d eig_vec = saes.eigenvalues();
+  bool passed = eig_vec[0] > icp_eigval && is_converge == 1;
+  voxelslam_offline::record_loop_icp_result(eig_vec[0], eig_vec[1], eig_vec[2], is_converge, passed, match_num);
   printf("eigvalue: %lf %lf %lf %d\n", eig_vec[0], eig_vec[1], eig_vec[2], is_converge);
-  return eig_vec[0] > icp_eigval && is_converge == 1;
+  return passed;
   // return eig_vec[0] > icp_eigval;
 
 }

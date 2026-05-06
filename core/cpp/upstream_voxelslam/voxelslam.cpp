@@ -1588,6 +1588,7 @@ public:
         sleep(0.001);
         continue;
       }
+      bool lidar_classified = false;
 
       static int first_flag = 1;
       if (first_flag)
@@ -1608,18 +1609,26 @@ public:
         if(init == 1)
         {
           motion_init_flag = 0;
+          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
+          lidar_classified = true;
         }
         else
         {
           if(init == -1)
             system_reset(imus);
+          voxelslam_offline::record_lidar_skipped_initializing(current_lidar_ticket);
+          lidar_classified = true;
           continue;
         }
       }
       else
       {
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
+        {
+          voxelslam_offline::record_lidar_skipped_imu_process(current_lidar_ticket);
+          lidar_classified = true;
           continue;
+        }
 
         pcl::PointCloud<PointType> pl_down = *pcl_curr;
         down_sampling_voxel(pl_down, down_size);
@@ -1669,6 +1678,7 @@ public:
 
         if(degrade_cnt > degrade_bound)
         {
+          voxelslam_offline::record_odometry_degrade_reset();
           degrade_cnt = 0;
           system_reset(imus);
 
@@ -1682,6 +1692,8 @@ public:
           motion_init_flag = 1;
           history_kfsize = 0;
 
+          voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
+          lidar_classified = true;
           continue;
         }
       }
@@ -1711,6 +1723,7 @@ public:
         mtx_loop.lock();
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
+        voxelslam_offline::record_loop_scanpose_queued();
 
         x_curr.R = x_buf[win_count-1].R;
         x_curr.p = x_buf[win_count-1].p;
@@ -1763,6 +1776,8 @@ public:
 
         win_base += mgsize; win_count -= mgsize;
       }
+      if(!lidar_classified)
+        voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
       
       double t_end = ros::Time::now().toSec();
       double mem = get_memory();
@@ -1908,6 +1923,7 @@ public:
       if(reset_flag == 1)
       {
         reset_flag = 0;
+        voxelslam_offline::record_loop_scanposes_transferred(buf_lba2loop_tem.size());
         scanPoses->insert(scanPoses->end(), buf_lba2loop_tem.begin(), buf_lba2loop_tem.end());
         for(ScanPose *bl: buf_lba2loop_tem) bl->pvec = nullptr;
         buf_lba2loop_tem.clear();
@@ -1953,12 +1969,14 @@ public:
       {
         bl_head = buf_lba2loop.front();
         buf_lba2loop.pop_front();
+        voxelslam_offline::record_loop_scanpose_popped();
       }
       mtx_loop.unlock();
       if(bl_head == nullptr) continue;
 
       int cur_id = std_managers.size() - 1;
       scanPoses->push_back(bl_head);
+      voxelslam_offline::record_loop_scanpose_integrated();
       bl_local.push_back(bl_head);
       IMUST xc = bl_head->x;
       gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
@@ -2042,13 +2060,16 @@ public:
 
         if(search_result.first >= 0)
         {
+          voxelslam_offline::record_loop_candidate(search_result.second);
           printf("Find Loop in session%d: %d %d\n", id, buf_base, search_result.first);
           printf("score: %lf\n", search_result.second);
         }
 
         if(search_result.first >= 0 && search_result.second > juds[id])
         {
-          if(icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval))
+          voxelslam_offline::record_loop_score_passed();
+          bool icp_ok = icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval);
+          if(icp_ok)
           {
             int ord_bl = std_managers[id]->plane_cloud_vec_[search_result.first]->header.seq;
 
@@ -2060,9 +2081,11 @@ public:
             if(id == cur_id)
             {
               double span = smp->jour - keyframes->at(search_result.first)->jour;
+              double drift_ratio = drift_p / span;
+              voxelslam_offline::record_loop_drift_ratio(drift_ratio, drift_ratio < ratio_drift);
               printf("drift: %lf %lf\n", drift_p, span);
 
-              if(drift_p / span < ratio_drift)
+              if(drift_ratio < ratio_drift)
               {
                 isPush = true;
                 step = stepsizes.size() - 2;
@@ -2093,7 +2116,9 @@ public:
               }
               else
               {
-                if(drift_p / jours[id] < 0.05)
+                double drift_ratio = drift_p / jours[id];
+                voxelslam_offline::record_loop_drift_ratio(drift_ratio, drift_ratio < 0.05);
+                if(drift_ratio < 0.05)
                 {
                   jours[id] = 1e-6; // set to 0
                   isPush = true;
@@ -2111,6 +2136,7 @@ public:
             {
               match_num++;
               lp_edges.push(id, cur_id, ord_bl, buf_base-1, loop_transform.second, loop_transform.first, v6_init);
+              voxelslam_offline::record_loop_edge_added();
               if(step > -1)
               {
                 int id1 = stepsizes[step] + ord_bl;
@@ -2148,6 +2174,7 @@ public:
         for(int i=0; i<5; i++) isam.update();
         gtsam::Values results = isam.calculateEstimate();
         int resultsize = results.size();
+        voxelslam_offline::record_loop_graph_optimization(resultsize);
         
         IMUST x1 = scanPoses->at(buf_base-1)->x;
         int idsize = ids.size();
@@ -2218,6 +2245,7 @@ public:
           history_kfsize = pl_kdmap->size();
         }
         loop_detect = 1;
+        voxelslam_offline::record_loop_update_applied();
 
         vector<int> ids2 = ids; ids2.pop_back();
         ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids2);
@@ -2285,6 +2313,7 @@ public:
     cnct_map = ids;
     gba_size = multimap_keyframes.back()->size();
     gba_flag = 1;
+    voxelslam_offline::record_gba_started(gba_size);
 
     pcl::PointCloud<PointType> pl0;
     pub_pl_func(pl0, pub_pmap);
@@ -2352,6 +2381,7 @@ public:
     Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
 
     double t1 = ros::Time::now().toSec();
+    voxelslam_offline::record_gba_completed(t1 - t0, resultsize, gba_edges1.edges.size(), gba_edges2.edges.size());
     printf("GBA opt: %lfs\n", t1 - t0);
 
     for(int ii=0; ii<idsize; ii++)
@@ -2434,6 +2464,8 @@ public:
       opt_lsv.thd_num = thread_num;
       vector<double> resis;
       bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
+      if(resis.size() >= 2 && resis[0] != 0)
+        voxelslam_offline::record_hba_fit(wdsize, voxhess.plvec_voxels.size(), fabs(resis[0] - resis[1]) / fabs(resis[0]), is_converge);
       if(is_display)
         printf("%lf\n", fabs(resis[0] - resis[1]) / resis[0]);
       if((fabs(resis[0] - resis[1]) / resis[0] < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))

@@ -44,8 +44,10 @@ class VoxelSlam:
         stamp: float,
         linear_acceleration: list[float] | tuple[float, float, float],
         angular_velocity: list[float] | tuple[float, float, float],
-    ) -> None:
-        self._core.push_imu(stamp, linear_acceleration, angular_velocity)
+    ) -> int:
+        """Queue one IMU sample and return its monotonically increasing ticket."""
+
+        return self._core.push_imu(stamp, linear_acceleration, angular_velocity)
 
     def push_lidar(
         self,
@@ -55,8 +57,10 @@ class VoxelSlam:
         intensities: Any | None = None,
         scan_duration: float = -1.0,
         stamp_is_end: bool = False,
-    ) -> None:
-        self._core.push_lidar(
+    ) -> int:
+        """Queue one lidar sweep and return the ticket used by wait_for_processed()."""
+
+        return self._core.push_lidar(
             stamp,
             points,
             relative_times,
@@ -83,6 +87,31 @@ class VoxelSlam:
         """Return the best available trajectory as Nx8 [stamp, x, y, z, qx, qy, qz, qw]."""
 
         return self._core.trajectory()
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return aggregate internal diagnostics collected so far."""
+
+        return self._core.diagnostics()
+
+    def status(self) -> dict[str, Any]:
+        """Return queue depths, tickets, and worker lifecycle state."""
+
+        return self._core.status()
+
+    @property
+    def latest_imu_ticket(self) -> int:
+        return self._core.latest_imu_ticket
+
+    @property
+    def latest_lidar_ticket(self) -> int:
+        return self._core.latest_lidar_ticket
+
+    def wait_for_processed(
+        self,
+        ticket: int | None = None,
+        timeout_seconds: float = -1.0,
+    ) -> None:
+        self._core.wait_for_processed(0 if ticket is None else ticket, timeout_seconds)
 
     def pop_deskewed_scans(self) -> list[Any]:
         """Return and clear pending deskewed scan batches.

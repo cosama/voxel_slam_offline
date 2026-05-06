@@ -4,6 +4,7 @@
 #include <Eigen/Geometry>
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace voxelslam_offline {
@@ -31,9 +32,46 @@ void reset_records(bool collect_map,
                    std::size_t max_map_points,
                    bool emit_deskewed_points);
 bool is_emitting_deskewed_points();
+void record_imu_pushed(std::uint64_t ticket);
+void record_imu_consumed(std::size_t count);
+void record_lidar_pushed(std::uint64_t ticket);
+void record_lidar_popped(std::uint64_t ticket);
+void record_lidar_processed(std::uint64_t ticket, bool pose_recorded);
+void record_lidar_skipped_initializing(std::uint64_t ticket);
+void record_lidar_skipped_imu_process(std::uint64_t ticket);
+void record_lidar_skipped_insufficient_imu(std::uint64_t ticket);
+void record_loop_scanpose_queued();
+void record_loop_scanpose_popped();
+void record_loop_scanpose_integrated();
+void record_loop_scanposes_transferred(std::size_t count);
+void record_odometry_thread_finished();
+void record_loop_thread_finished();
+void record_gba_thread_finished();
 void record_pose(double stamp, const Eigen::Vector3d& position, const Eigen::Quaterniond& orientation);
 void record_optimized_poses(const std::vector<PoseRecord>& poses);
 void record_map_point(double stamp, float x, float y, float z, float intensity);
 void record_dense_deskewed_points(const std::vector<PointRecord>& points);
+void record_odometry_degrade_reset();
+void record_loop_candidate(double score);
+void record_loop_score_passed();
+void record_loop_icp_result(double eig0,
+                            double eig1,
+                            double eig2,
+                            int converged,
+                            bool passed,
+                            int match_count);
+void record_loop_drift_ratio(double ratio, bool passed);
+void record_loop_edge_added();
+void record_loop_graph_optimization(std::size_t pose_count);
+void record_loop_update_applied();
+void record_hba_fit(int window_size,
+                    std::size_t voxel_count,
+                    double residual_improvement,
+                    bool converged);
+void record_gba_started(int keyframes);
+void record_gba_completed(double runtime_seconds,
+                          std::size_t pose_count,
+                          std::size_t stage1_edges,
+                          std::size_t stage2_edges);
 
 }  // namespace voxelslam_offline

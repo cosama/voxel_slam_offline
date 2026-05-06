@@ -5,6 +5,8 @@
 #include "voxel_map.hpp"
 #include "feature_point.hpp"
 #include "loop_refine.hpp"
+#include <voxelslam/offline_bridge.hpp>
+#include <cstdint>
 #include <mutex>
 #include <Eigen/Eigenvalues>
 #include <tf/transform_broadcaster.h>
@@ -44,10 +46,14 @@ Features feat;
 deque<sensor_msgs::Imu::Ptr> imu_buf;
 deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
 deque<double> time_buf;
+deque<std::uint64_t> lidar_ticket_buf;
 
 double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
+bool pl_ready = false;
+std::uint64_t ros_lidar_ticket = 0;
+std::uint64_t current_lidar_ticket = 0;
 
 void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
@@ -99,22 +105,27 @@ void pcl_handler(T &msg)
   mBuf.lock();
   time_buf.push_back(t0);
   pcl_buf.push_back(pl_ptr);
+  lidar_ticket_buf.push_back(++ros_lidar_ticket);
   mBuf.unlock();
 }
 
 bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu)
 {
-  static bool pl_ready = false;
-
   if(!pl_ready)
   {
-    if(pcl_buf.empty()) return false;
-
     mBuf.lock();
+    if(pcl_buf.empty())
+    {
+      mBuf.unlock();
+      return false;
+    }
     pl_ptr = pcl_buf.front();
     p_imu.pcl_beg_time = time_buf.front();
+    current_lidar_ticket = lidar_ticket_buf.empty() ? 0 : lidar_ticket_buf.front();
     pcl_buf.pop_front(); time_buf.pop_front();
+    if(!lidar_ticket_buf.empty()) lidar_ticket_buf.pop_front();
     mBuf.unlock();
+    voxelslam_offline::record_lidar_popped(current_lidar_ticket);
 
     p_imu.pcl_end_time = p_imu.pcl_beg_time + pl_ptr->back().curvature;
 
@@ -123,6 +134,7 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
       if(last_pcl_time < 0)
       {
         last_pcl_time = p_imu.pcl_beg_time;
+        voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
         return false;
       }
 
@@ -134,18 +146,29 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
     pl_ready = true;
   }
 
-  if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
+  mBuf.lock();
+  double last_imu_time = imu_last_time;
+  mBuf.unlock();
+  if(!pl_ready || last_imu_time <= p_imu.pcl_end_time) return false;
 
   mBuf.lock();
+  if(imu_buf.empty())
+  {
+    mBuf.unlock();
+    return false;
+  }
   double imu_time = imu_buf.front()->header.stamp.toSec();
+  std::size_t consumed_imu = 0;
   while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
   {
     imu_time = imu_buf.front()->header.stamp.toSec();
     if(imu_time > p_imu.pcl_end_time) break;
     imus.push_back(imu_buf.front());
     imu_buf.pop_front();
+    consumed_imu++;
   }
   mBuf.unlock();
+  voxelslam_offline::record_imu_consumed(consumed_imu);
 
   if(imu_buf.empty())
   {
@@ -157,7 +180,10 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
   if(imus.size() > 4)
     return true;
   else
+  {
+    voxelslam_offline::record_lidar_skipped_insufficient_imu(current_lidar_ticket);
     return false;
+  }
 }
 
 double dept_err, beam_err;

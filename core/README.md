@@ -49,12 +49,13 @@ lidar_to_imu = np.array([
 
 slam = voxelslam.VoxelSlam(config, lidar_to_imu=lidar_to_imu)
 slam.push_imu(stamp, [ax, ay, az], [gx, gy, gz])
-slam.push_lidar(
+ticket = slam.push_lidar(
     stamp=sweep_start_time,
     points=np.asarray(points_xyz, dtype=np.float32),
     relative_times=np.asarray(point_offsets_s, dtype=np.float32),
     intensities=np.asarray(intensity, dtype=np.float32),
 )
+slam.wait_for_processed(ticket)  # optional; useful for deterministic offline replay
 result = slam.finish()
 
 trajectory = result.trajectory  # Nx8: stamp,x,y,z,qx,qy,qz,qw
@@ -66,10 +67,13 @@ without calling `finish()`:
 ```python
 pose = slam.latest_pose()    # shape (8,), or None before the first pose
 path = slam.trajectory()     # best available Nx8 trajectory
+diagnostics = slam.diagnostics()  # aggregate counters and fit summaries
+status = slam.status()       # queue depths, tickets, and worker lifecycle state
 scans = slam.pop_deskewed_scans()  # list of Nx5 stamp,x,y,z,intensity arrays
 ```
 
-`finish()` is only for shutdown.
+`finish()` is only for shutdown. `result.diagnostics` returns the final
+aggregate diagnostics without per-frame logs.
 
 Transforms are 4x4 homogeneous matrices. If the surrounding application has an
 IMU-to-lidar transform instead, pass it as `imu_to_lidar`; the wrapper inverts

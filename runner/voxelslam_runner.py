@@ -106,6 +106,8 @@ def run_bag(
     )
     imu_count = 0
     lidar_count = 0
+    last_imu_stamp = None
+    pending_lidar = []
     start_time = time.monotonic()
 
     try:
@@ -122,7 +124,15 @@ def run_bag(
                         [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z],
                         [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
                     )
+                    last_imu_stamp = stamp
                     imu_count += 1
+                    lidar_count += push_ready_lidar(
+                        slam,
+                        pending_lidar,
+                        dense_map,
+                        last_imu_stamp=last_imu_stamp,
+                        stamp_is_end=runner_config.stamp_is_end,
+                    )
                 else:
                     stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
                     points, times, intensities = parse_pointcloud(
@@ -130,19 +140,26 @@ def run_bag(
                         stamp,
                         scan_duration=runner_config.scan_duration,
                     )
-                    slam.push_lidar(
-                        stamp,
-                        points,
-                        times,
-                        intensities,
+                    pending_lidar.append((stamp, points, times, intensities))
+                    lidar_count += push_ready_lidar(
+                        slam,
+                        pending_lidar,
+                        dense_map,
+                        last_imu_stamp=last_imu_stamp,
                         stamp_is_end=runner_config.stamp_is_end,
                     )
-                    lidar_count += 1
-                    if dense_map is not None:
-                        dense_map.drain_from(slam)
                     report_progress(dense_map, imu_count, lidar_count, start_time)
 
+        lidar_count += push_ready_lidar(
+            slam,
+            pending_lidar,
+            dense_map,
+            last_imu_stamp=last_imu_stamp,
+            stamp_is_end=runner_config.stamp_is_end,
+            require_all=True,
+        )
         result = slam.finish()
+        pipeline_status = slam.status()
         if dense_map is not None:
             dense_map.drain_from(slam)
 
@@ -175,11 +192,53 @@ def run_bag(
         "pointcloud_ply": str(pointcloud_ply) if pointcloud_ply else None,
         "dense_scans": dense_map.scans if dense_map is not None else 0,
         "dense_points": dense_map.points if dense_map is not None else 0,
+        "diagnostics": {
+            "internal": result.diagnostics,
+            "pipeline": pipeline_status,
+        },
     }
     manifest = output_dir / "manifest.json"
     summary["manifest"] = str(manifest)
     manifest.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
+
+
+def push_ready_lidar(
+    slam: VoxelSlam,
+    pending_lidar: list,
+    dense_map: "DenseMapBuffer | None",
+    *,
+    last_imu_stamp: float | None,
+    stamp_is_end: bool,
+    require_all: bool = False,
+) -> int:
+    pushed = 0
+    while pending_lidar:
+        stamp, points, times, intensities = pending_lidar[0]
+        if points.size == 0:
+            pending_lidar.pop(0)
+            continue
+        scan_end = stamp if stamp_is_end else stamp + float(np.max(times))
+        if last_imu_stamp is None or last_imu_stamp <= scan_end:
+            if require_all:
+                raise RuntimeError(
+                    "not enough IMU after final lidar message "
+                    f"(last_imu={last_imu_stamp}, scan_end={scan_end})"
+                )
+            break
+        pending_lidar.pop(0)
+        ticket = slam.push_lidar(
+            stamp,
+            points,
+            times,
+            intensities,
+            stamp_is_end=stamp_is_end,
+        )
+        slam.wait_for_processed(ticket)
+        if dense_map is not None:
+            dense_map.drain_from(slam)
+        pushed += 1
+    return pushed
 
 
 def report_progress(
@@ -188,7 +247,7 @@ def report_progress(
     lidar_count: int,
     start_time: float,
 ) -> None:
-    if PROGRESS_INTERVAL <= 0 or lidar_count % PROGRESS_INTERVAL != 0:
+    if lidar_count <= 0 or PROGRESS_INTERVAL <= 0 or lidar_count % PROGRESS_INTERVAL != 0:
         return
     elapsed = time.monotonic() - start_time
     dense = ""
