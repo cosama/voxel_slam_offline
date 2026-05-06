@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxel-slam-runner"
+version = "0.1.0"
+description = "Offline bag runner for voxel-slam-offline"
+license = { text = "GPL-2.0-only" }
+requires-python = ">=3.10"
+dependencies = [
+    "plyfile>=0.9",
+    "rosbags>=0.10",
+    "voxel-slam-offline>=0.1.0",
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+]
+
+[project.scripts]
+voxelslam-run-bag = "run_bag:main"
+
+[tool.setuptools]
+py-modules = ["run_bag"]

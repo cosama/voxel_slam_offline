@@ -1,7 +1,7 @@
 # Docker
 
-Build from the package root so `.dockerignore` applies and the image contains
-only the ROS-free Voxel-SLAM package:
+Build from the repository root so `.dockerignore` applies and the image contains
+the ROS-free Voxel-SLAM core plus the offline runner:
 
 ```bash
 docker build -f docker/Dockerfile -t voxel-slam-offline .

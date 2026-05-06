@@ -5,7 +5,7 @@
 Built on Ubuntu 24.04 with:
 
 ```bash
-python3 -m pip install --user --break-system-packages -e .
+python3 -m pip install --user --break-system-packages -e ./core
 ```
 
 Native build dependencies used during this test:

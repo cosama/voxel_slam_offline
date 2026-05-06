@@ -13,12 +13,6 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
 ]
 
-[project.optional-dependencies]
-runner = ["plyfile>=0.9", "rosbags>=0.10"]
-
-[project.scripts]
-voxelslam-run-bag = "voxelslam.run_bag:main"
-
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = ["python/voxelslam"]

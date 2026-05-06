@@ -17,7 +17,7 @@ import numpy as np
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
-from . import VoxelSlam, VoxelSlamConfig
+from voxelslam import VoxelSlam, VoxelSlamConfig
 
 
 POINTFIELD_DTYPES = {

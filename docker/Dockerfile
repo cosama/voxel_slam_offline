@@ -24,7 +24,7 @@ COPY . /src
 
 RUN python3 -m venv /opt/build-venv \
     && /opt/build-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
-    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse '.[runner]'
+    && /opt/build-venv/bin/pip wheel --no-cache-dir --wheel-dir /wheelhouse ./core ./runner
 
 FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
@@ -45,7 +45,7 @@ RUN apt-get update \
 COPY --from=builder /wheelhouse /wheelhouse
 
 RUN python3 -m venv /opt/voxelslam \
-    && /opt/voxelslam/bin/pip install --no-cache-dir --no-index --find-links=/wheelhouse 'voxel-slam-offline[runner]' \
+    && /opt/voxelslam/bin/pip install --no-cache-dir --no-index --find-links=/wheelhouse voxel-slam-offline voxel-slam-runner \
     && rm -rf /wheelhouse
 
 WORKDIR /data
