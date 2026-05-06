@@ -23,6 +23,8 @@ from voxelslam import (
 
 
 PROGRESS_INTERVAL = 100
+IMU_TIME_EPSILON_SECONDS = 1e-6
+PROCESSING_TIMEOUT_SECONDS = 120.0
 TRAJECTORY_FRAME_ID = "map"
 TRAJECTORY_CHILD_FRAME_ID = "base_link"
 
@@ -219,7 +221,7 @@ def push_ready_lidar(
             pending_lidar.pop(0)
             continue
         scan_end = stamp if stamp_is_end else stamp + float(np.max(times))
-        if last_imu_stamp is None or last_imu_stamp <= scan_end:
+        if last_imu_stamp is None or last_imu_stamp <= scan_end + IMU_TIME_EPSILON_SECONDS:
             if require_all:
                 raise RuntimeError(
                     "not enough IMU after final lidar message "
@@ -234,7 +236,13 @@ def push_ready_lidar(
             intensities,
             stamp_is_end=stamp_is_end,
         )
-        slam.wait_for_processed(ticket)
+        try:
+            slam.wait_for_processed(ticket, PROCESSING_TIMEOUT_SECONDS)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"timed out waiting for Voxel-SLAM lidar ticket {ticket}; "
+                f"status={slam.status()}"
+            ) from exc
         if dense_map is not None:
             dense_map.drain_from(slam)
         pushed += 1
