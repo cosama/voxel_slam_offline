@@ -50,4 +50,4 @@ RUN python3 -m venv /opt/voxelslam \
 
 WORKDIR /data
 
-CMD ["python", "-c", "import voxelslam; print('voxel-slam-offline ready')"]
+CMD ["python", "-c", "import voxelslam, voxelslam_runner; print('voxel-slam-offline ready')"]

@@ -29,8 +29,7 @@ struct PointRecord {
 
 void reset_records(bool collect_map,
                    std::size_t max_map_points,
-                   bool emit_deskewed_points,
-                   std::size_t max_pending_deskewed_scans);
+                   bool emit_deskewed_points);
 bool is_emitting_deskewed_points();
 void record_pose(double stamp, const Eigen::Vector3d& position, const Eigen::Quaterniond& orientation);
 void record_optimized_poses(const std::vector<PoseRecord>& poses);

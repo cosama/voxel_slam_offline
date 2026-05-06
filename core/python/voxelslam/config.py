@@ -8,20 +8,6 @@ import numpy as np
 from ._core import VoxelSlamOptions
 
 
-LIDAR_TYPES = {
-    "avia": 0,
-    "livox": 0,
-    "mid360": 0,
-    "velodyne": 1,
-    "ouster": 2,
-    "hesai": 3,
-    "robosense": 4,
-    "rslidar": 4,
-    "tartan": 5,
-    "tartanair": 5,
-}
-
-
 @dataclass(slots=True)
 class VoxelSlamConfig:
     """Single Python-side config object.
@@ -30,12 +16,8 @@ class VoxelSlamConfig:
     `imu_to_lidar` to `VoxelSlam` so calibration has one explicit path.
     """
 
-    save_path: str = "/tmp/voxel_slam_offline/"
-    bagname: str = "offline"
-    lidar_type: str | int = "velodyne"
     blind: float = 2.8
     point_filter_num: int = 3
-    is_save_map: bool = False
 
     odom_cov_gyr: float = 0.01
     odom_cov_acc: float = 1.0
@@ -74,10 +56,7 @@ class VoxelSlamConfig:
     gba_eigen_value_array: list[float] = field(default_factory=lambda: [9.0, 9.0, 9.0, 9.0])
     gba_total_max_iter: int = 3
 
-    collect_map: bool = False
-    max_map_points: int = 0
     emit_deskewed_points: bool = False
-    max_pending_deskewed_scans: int = 16
     enable_loop_closure: bool = True
     enable_global_mapping: bool = True
 
@@ -137,8 +116,6 @@ def _parse_transform(transform: Any, label: str) -> np.ndarray:
 
 def _set_option(options: VoxelSlamOptions, attr: str, value: Any, errors: list[str]) -> None:
     try:
-        if attr == "lidar_type" and isinstance(value, str):
-            value = _lidar_type_from_string(value)
         current = getattr(options, attr)
         setattr(options, attr, _coerce_value(value, current, attr))
     except Exception as exc:
@@ -179,11 +156,3 @@ def _coerce_bool(value: Any) -> bool:
         if lowered in {"0", "false", "no", "off"}:
             return False
     raise TypeError(f"expected bool, got {value!r}")
-
-
-def _lidar_type_from_string(value: str) -> int:
-    key = value.strip().lower().replace("-", "").replace("_", "")
-    if key not in LIDAR_TYPES:
-        allowed = ", ".join(sorted(LIDAR_TYPES))
-        raise ValueError(f"unknown lidar_type {value!r}; allowed: {allowed}")
-    return LIDAR_TYPES[key]

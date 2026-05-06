@@ -36,7 +36,6 @@ struct Recorder {
   bool collect_map = false;
   std::size_t max_map_points = 0;
   bool emit_deskewed_points = false;
-  std::size_t max_pending_deskewed_scans = 16;
 };
 
 Recorder& recorder() {
@@ -46,8 +45,7 @@ Recorder& recorder() {
 
 void reset_records(bool collect_map,
                    std::size_t max_map_points,
-                   bool emit_deskewed_points,
-                   std::size_t max_pending_deskewed_scans) {
+                   bool emit_deskewed_points) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   std::vector<PoseRecord>().swap(rec.poses);
@@ -57,7 +55,6 @@ void reset_records(bool collect_map,
   rec.collect_map = collect_map;
   rec.max_map_points = max_map_points;
   rec.emit_deskewed_points = emit_deskewed_points;
-  rec.max_pending_deskewed_scans = std::max<std::size_t>(1, max_pending_deskewed_scans);
 }
 
 bool is_emitting_deskewed_points() {
@@ -104,9 +101,6 @@ void record_dense_deskewed_points(const std::vector<PointRecord>& points) {
   std::lock_guard<std::mutex> lock(rec.mutex);
   if (!rec.emit_deskewed_points || points.empty()) {
     return;
-  }
-  if (rec.deskewed_scans.size() >= rec.max_pending_deskewed_scans) {
-    throw std::runtime_error("deskewed scan queue full; call pop_deskewed_scans() more often");
   }
   rec.deskewed_scans.push_back(points);
 }
@@ -211,7 +205,6 @@ struct VoxelSlamOptions {
   bool collect_map = false;
   std::size_t max_map_points = 0;
   bool emit_deskewed_points = false;
-  std::size_t max_pending_deskewed_scans = 16;
   bool enable_loop_closure = true;
   bool enable_global_mapping = true;
 };
@@ -282,8 +275,7 @@ class VoxelSlam {
     reset_upstream_buffers();
     voxelslam_offline::reset_records(options_.collect_map,
                                      options_.max_map_points,
-                                     options_.emit_deskewed_points,
-                                     options_.max_pending_deskewed_scans);
+                                     options_.emit_deskewed_points);
     configure_node(options_);
 
     slam_ = std::make_unique<VOXEL_SLAM>(node_);
@@ -433,12 +425,12 @@ class VoxelSlam {
     pcl_buf.push_back(cloud);
   }
 
-  const Result& finish(double drain_timeout_seconds = 30.0) {
+  const Result& finish(double timeout_seconds = 30.0) {
     if (finished_) {
       return result_;
     }
 
-    wait_for_processing(drain_timeout_seconds);
+    wait_for_processing(timeout_seconds);
     request_finish();
     if (has_thread_error()) {
       node_.setParam("__shutdown", true);
@@ -735,7 +727,6 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("collect_map", &VoxelSlamOptions::collect_map)
       .def_readwrite("max_map_points", &VoxelSlamOptions::max_map_points)
       .def_readwrite("emit_deskewed_points", &VoxelSlamOptions::emit_deskewed_points)
-      .def_readwrite("max_pending_deskewed_scans", &VoxelSlamOptions::max_pending_deskewed_scans)
       .def_readwrite("enable_loop_closure", &VoxelSlamOptions::enable_loop_closure)
       .def_readwrite("enable_global_mapping", &VoxelSlamOptions::enable_global_mapping);
 
@@ -767,7 +758,7 @@ PYBIND11_MODULE(_core, m) {
       .def("is_finished", &VoxelSlam::is_finished)
       .def("finish",
            &VoxelSlam::finish,
-           py::arg("drain_timeout_seconds") = 30.0,
+           py::arg("timeout_seconds") = 30.0,
            py::call_guard<py::gil_scoped_release>(),
            py::return_value_policy::reference_internal);
 }

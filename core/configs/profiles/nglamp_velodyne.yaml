@@ -3,11 +3,8 @@
 # voxelslam and pass the numeric extrinsic to VoxelSlam(..., lidar_to_imu=...).
 
 General:
-  bagname: canonical
-  lidar_type: velodyne
   blind: 2.8
   point_filter_num: 3
-  is_save_map: false
 
 Odometry:
   cov_gyr: 0.01
@@ -51,6 +48,5 @@ GBA:
   total_max_iter: 3
 
 Runtime:
-  collect_map: false
   enable_loop_closure: true
   enable_global_mapping: true

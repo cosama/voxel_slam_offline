@@ -1,8 +1,8 @@
 # Voxel-SLAM Runner
 
 Small offline runner for the ROS-free `voxelslam` library. It owns dataset
-plumbing only: ROS1/ROS2 bag reading through `rosbags`, URDF fixed-transform
-lookup, JSON config loading, trajectory CSV writing, and optional PLY export.
+plumbing only: ROS1/ROS2 bag reading through `rosbags`, JSON config loading,
+and optional dense PLY export through `voxelslam.DenseMapBuffer`.
 
 Install the core library first, then the runner dependencies:
 

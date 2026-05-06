@@ -3,11 +3,8 @@
 # can change trajectory behavior relative to the default point_filter_num=3 run.
 
 General:
-  bagname: canonical_full_points
-  lidar_type: velodyne
   blind: 2.8
   point_filter_num: 1
-  is_save_map: false
 
 Odometry:
   cov_gyr: 0.01
@@ -51,8 +48,6 @@ GBA:
   total_max_iter: 3
 
 Runtime:
-  collect_map: false
   emit_deskewed_points: true
-  max_pending_deskewed_scans: 16
   enable_loop_closure: true
   enable_global_mapping: true

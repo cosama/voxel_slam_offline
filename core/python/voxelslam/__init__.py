@@ -4,6 +4,14 @@ from typing import Any
 
 from ._core import Result, VoxelSlam as _CoreVoxelSlam
 from .config import VoxelSlamConfig
+from .dense_map import DenseMapBuffer
+from .io import (
+    UrdfTransforms,
+    pointcloud_to_numpy,
+    write_trajectory_csv,
+)
+from .ply import BinaryPlyWriter
+from .pointcloud import PointCloudBuffer
 
 
 class VoxelSlam:
@@ -57,8 +65,8 @@ class VoxelSlam:
             stamp_is_end,
         )
 
-    def finish(self, drain_timeout_seconds: float = 30.0) -> Result:
-        return self._core.finish(drain_timeout_seconds)
+    def finish(self, timeout_seconds: float = 30.0) -> Result:
+        return self._core.finish(timeout_seconds)
 
     def request_finish(self) -> None:
         self._core.request_finish()
@@ -87,7 +95,13 @@ class VoxelSlam:
 
 
 __all__ = [
+    "BinaryPlyWriter",
+    "DenseMapBuffer",
+    "PointCloudBuffer",
     "Result",
+    "UrdfTransforms",
     "VoxelSlam",
     "VoxelSlamConfig",
+    "pointcloud_to_numpy",
+    "write_trajectory_csv",
 ]

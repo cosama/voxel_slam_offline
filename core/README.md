@@ -34,10 +34,8 @@ import numpy as np
 import voxelslam
 
 config = voxelslam.VoxelSlamConfig()
-config.lidar_type = "velodyne"
 config.blind = 2.8
 config.point_filter_num = 3
-config.collect_map = False
 config.enable_loop_closure = True
 config.enable_global_mapping = True
 
@@ -60,7 +58,6 @@ slam.push_lidar(
 result = slam.finish()
 
 trajectory = result.trajectory  # Nx8: stamp,x,y,z,qx,qy,qz,qw
-map_points = result.map_points  # Nx5: stamp,x,y,z,intensity; empty unless collected
 ```
 
 For online use, keep one `VoxelSlam` instance alive and read pose snapshots
@@ -92,7 +89,6 @@ p_lidar = R_lidar_imu * p_imu + t_lidar_imu
 
 ```python
 config = voxelslam.VoxelSlamConfig(
-    lidar_type="velodyne",
     point_filter_num=3,
     emit_deskewed_points=False,
 )
@@ -124,10 +120,24 @@ for scan in slam.pop_deskewed_scans():
     ...
 ```
 
-The ROS-free API returns trajectory and point data to Python. Writing CSV, PLY,
-or any benchmark-specific artifacts belongs in the caller. The retained upstream
-`is_save_map` and pose-graph file paths still exist for compatibility, but they
-are not the preferred package interface.
+The ROS-free API returns trajectory and point data to Python. `BinaryPlyWriter`
+writes generic Nx5 point arrays. `PointCloudBuffer` stores Nx5 point batches in
+memory and spills to a binary file after `memory_limit_bytes`. `DenseMapBuffer`
+is the Voxel-SLAM-specific wrapper that drains deskewed scans during a run and
+writes the final dense map after `finish()` returns the optimized trajectory.
+`write_trajectory_csv` writes the standard trajectory CSV. `pointcloud_to_numpy`
+parses ROS1/ROS2 PointCloud2-like messages into structured NumPy arrays without
+depending on ROS.
+
+For URDF extrinsics, `UrdfTransforms` reads fixed-joint chains and returns a
+4x4 transform:
+
+```python
+lidar_to_imu = voxelslam.UrdfTransforms.read("system.urdf").get_transform(
+    target_frame="imu_link",
+    source_frame="velodyne",
+)
+```
 
 Deskewed point batches are optional and non-retained: enable
 `config.emit_deskewed_points` and drain them with `pop_deskewed_scans()`.
@@ -137,7 +147,7 @@ them; after `finish()` this is the final optimized trajectory when available.
 ## Bag Runner
 
 The offline bag runner now lives in the top-level `runner/` component. The core
-library intentionally stays free of bag, URDF, CSV, and PLY dependencies.
+library intentionally stays free of bag-reading dependencies.
 
 ## Notes
 
