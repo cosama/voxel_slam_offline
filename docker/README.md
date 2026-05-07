@@ -1,7 +1,8 @@
 # Docker
 
-Build from the repository root so `.dockerignore` applies and the image contains
-the ROS-free Voxel-SLAM core plus the offline runner:
+Container build for the core library plus optional bag runner.
+
+Build from the repository root so `.dockerignore` applies:
 
 ```bash
 docker build -f docker/Dockerfile -t voxel-slam-offline .
@@ -10,11 +11,10 @@ docker build -f docker/Dockerfile -t voxel-slam-offline .
 Smoke test:
 
 ```bash
-docker run --rm voxel-slam-offline
 docker run --rm voxel-slam-offline python -c "import voxelslam; print(voxelslam.VoxelSlamConfig())"
 ```
 
-Run the bag frontend by mounting data and output paths:
+Run the bag frontend:
 
 ```bash
 docker run --rm \
@@ -24,15 +24,7 @@ docker run --rm \
   voxelslam-run-bag /data/bag /data/system.urdf /data/config.json /output
 ```
 
-Publishable image name for GitHub Container Registry:
-
-```bash
-ghcr.io/<user-or-org>/voxel-slam-offline:<tag>
-```
-
-The GitHub Actions workflow builds pull requests without pushing and publishes
-on pushes to `main`, tags matching `v*`, and manual dispatches. For this
-repository the published image is:
+Published image:
 
 ```bash
 ghcr.io/cosama/voxel_slam_offline:<tag>

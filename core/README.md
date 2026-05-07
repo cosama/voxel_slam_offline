@@ -1,162 +1,50 @@
-# Voxel-SLAM Offline
+# Voxel-SLAM Core
 
-ROS-free offline Python bindings for the HKU-MARS Voxel-SLAM core.
+Importable `voxelslam` library and native C++ extension.
 
-This package intentionally does one job: run Voxel-SLAM on IMU samples and
-decoded lidar sweeps. It does not parse ROS bags, URDF, TF, YAML, or ROS
-parameters. Build those inputs outside the package and pass plain Python data.
+This package exposes Voxel-SLAM as a ROS-free Python API. It accepts IMU samples,
+lidar sweeps, and one explicit IMU/lidar extrinsic transform. It returns pose
+snapshots, trajectories, optional deskewed scan batches, status, and final
+metrics.
 
-## Current Scope
+## Install
 
-- No ROS1 or ROS2 build/runtime dependency.
-- PCL, Eigen and GTSAM are still native dependencies.
-- Python feeds IMU samples and already decoded lidar sweeps.
-- Point clouds must remain in the lidar frame.
-- The caller supplies the numeric IMU/lidar extrinsic.
-- Lidar timestamps are explicit: pass the sweep stamp plus per-point relative
-  times in seconds. If a source header represents the end of a sweep, call
-  `push_lidar(..., stamp_is_end=True)`.
+From the repository root:
 
-The vendored upstream reference is
-[hku-mars/Voxel-SLAM](https://github.com/hku-mars/Voxel-SLAM) at commit
-`70fc8a28d63823d5989ff184daeea0787b672398`.
+```bash
+pip install ./core
+```
 
-## License
+The Python dependency is NumPy. The native extension still depends on the C++
+libraries required by upstream Voxel-SLAM, including PCL, Eigen, and GTSAM.
 
-This package is licensed under GPL-2.0-only because it contains and links
-against upstream HKU-MARS Voxel-SLAM code. If this creates a practical issue
-for your use case, please reach out so we can discuss options.
+## API Contract
 
-## Minimal Usage
+Main public objects:
+
+- `VoxelSlamConfig`: dataclass containing SLAM parameters only.
+- `VoxelSlam`: long-lived SLAM instance.
+- `Result`: returned by `finish()`, with `trajectory` and `metrics`.
+- `DenseMapBuffer`, `PointCloudBuffer`, `BinaryPlyWriter`: optional point-cloud
+  output helpers.
+- `UrdfTransforms`, `pointcloud_to_numpy`, `write_trajectory_csv`: small I/O
+  utilities used by frontends.
+
+Core usage:
 
 ```python
-import numpy as np
-import voxelslam
-
-config = voxelslam.VoxelSlamConfig()
-config.blind = 2.8
-config.point_filter_num = 3
-config.enable_loop_closure = True
-config.enable_global_mapping = True
-
-# p_imu = T_imu_lidar * p_lidar
-lidar_to_imu = np.array([
-    [1.0, 0.0, 0.0, -0.114],
-    [0.0, -1.0, 0.0, 0.0],
-    [0.0, 0.0, -1.0, -0.05],
-    [0.0, 0.0, 0.0, 1.0],
-])
-
-slam = voxelslam.VoxelSlam(config, lidar_to_imu=lidar_to_imu)
+slam = voxelslam.VoxelSlam(config, lidar_to_imu=T_imu_lidar)
 slam.push_imu(stamp, [ax, ay, az], [gx, gy, gz])
-ticket = slam.push_lidar(
-    stamp=sweep_start_time,
-    points=np.asarray(points_xyz, dtype=np.float32),
-    relative_times=np.asarray(point_offsets_s, dtype=np.float32),
-    intensities=np.asarray(intensity, dtype=np.float32),
-)
-slam.wait_for_processed(ticket)  # optional; useful for deterministic offline replay
+ticket = slam.push_lidar(stamp, points_xyz, relative_times, intensities)
+slam.wait_for_processed(ticket)
 result = slam.finish()
-
-trajectory = result.trajectory  # Nx8: stamp,x,y,z,qx,qy,qz,qw
 ```
 
-For online use, keep one `VoxelSlam` instance alive and read pose snapshots
-without calling `finish()`:
-
-```python
-pose = slam.latest_pose()    # shape (8,), or None before the first pose
-path = slam.trajectory()     # best available Nx8 trajectory
-metrics = slam.metrics()  # aggregate counters and fit summaries
-status = slam.status()       # queue depths, tickets, and worker lifecycle state
-scans = slam.pop_deskewed_scans()  # list of Nx5 stamp,x,y,z,intensity arrays
-```
-
-`finish()` is only for shutdown. `result.metrics` returns the final aggregate
-metrics without per-frame logs.
-
-Transforms are 4x4 homogeneous matrices. If the surrounding application has an
-IMU-to-lidar transform instead, pass it as `imu_to_lidar`; the wrapper inverts
-it before calling upstream Voxel-SLAM.
-
-```python
-slam = voxelslam.VoxelSlam(config, imu_to_lidar=T_lidar_imu)
-```
-
-`imu_to_lidar` means:
-
-```text
-p_lidar = R_lidar_imu * p_imu + t_lidar_imu
-```
-
-## Config
-
-```python
-config = voxelslam.VoxelSlamConfig(
-    point_filter_num=3,
-    emit_deskewed_points=False,
-)
-```
-
-`VoxelSlamConfig` is the public configuration interface. It is a single
-standard-library dataclass with sane defaults. Extrinsics are not part of the
-config object; pass the transform as the dedicated constructor argument so
-calibration has a single explicit path.
-
-For short smoke tests or odometry-only experiments:
-
-```python
-config = voxelslam.VoxelSlamConfig(
-    enable_loop_closure=False,
-    enable_global_mapping=False,
-)
-```
-
-For per-scan internal-deskew point output:
-
-```python
-config = voxelslam.VoxelSlamConfig()
-config.point_filter_num = 1
-config.emit_deskewed_points = True
-
-for scan in slam.pop_deskewed_scans():
-    # scan columns: stamp,x,y,z,intensity in the scan-end lidar frame
-    ...
-```
-
-The ROS-free API returns trajectory and point data to Python. `BinaryPlyWriter`
-writes generic Nx5 point arrays. `PointCloudBuffer` stores Nx5 point batches in
-memory and spills to a binary file after `memory_limit_bytes`. `DenseMapBuffer`
-is the Voxel-SLAM-specific wrapper that drains deskewed scans during a run and
-writes the final dense map after `finish()` returns the optimized trajectory.
-`write_trajectory_csv` writes the standard trajectory CSV. `pointcloud_to_numpy`
-parses ROS1/ROS2 PointCloud2-like messages into structured NumPy arrays without
-depending on ROS.
-
-For URDF extrinsics, `UrdfTransforms` reads fixed-joint chains and returns a
-4x4 transform:
-
-```python
-lidar_to_imu = voxelslam.UrdfTransforms.read("system.urdf").get_transform(
-    target_frame="imu_link",
-    source_frame="velodyne",
-)
-```
-
-Deskewed point batches are optional and non-retained: enable
-`config.emit_deskewed_points` and drain them with `pop_deskewed_scans()`.
-They are returned in the scan-end lidar frame. Use `trajectory()` to assemble
-them; after `finish()` this is the final optimized trajectory when available.
-
-## Bag Runner
-
-The offline bag runner now lives in the top-level `runner/` component. The core
-library intentionally stays free of bag-reading dependencies.
+`finish()` is for shutdown. For online-style operation, read `latest_pose()`,
+`trajectory()`, `status()`, and `metrics()` while the instance remains active.
 
 ## Notes
 
-The first extraction still uses a small internal compatibility layer to keep the
-upstream algorithm close to its original structure. It is not a ROS dependency,
-but several upstream files still contain ROS-shaped names internally. The next
-cleanup pass should split the large upstream translation unit into a conventional
-library and remove the compatibility layer from internal type names.
+The upstream reference is vendored separately under
+`core/third_party/Voxel-SLAM/`. The active C++ bridge keeps upstream file changes
+small and exposes only the ROS-free API described above.
