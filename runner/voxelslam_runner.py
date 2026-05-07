@@ -24,7 +24,8 @@ from voxelslam import (
 
 PROGRESS_INTERVAL = 100
 IMU_TIME_EPSILON_SECONDS = 1e-6
-PROCESSING_TIMEOUT_SECONDS = 120.0
+REQUIRED_TRAILING_IMU_SECONDS = 0.005
+PROCESSING_TIMEOUT_SECONDS = 30.0
 TRAJECTORY_FRAME_ID = "map"
 TRAJECTORY_CHILD_FRAME_ID = "base_link"
 
@@ -194,10 +195,8 @@ def run_bag(
         "pointcloud_ply": str(pointcloud_ply) if pointcloud_ply else None,
         "dense_scans": dense_map.scans if dense_map is not None else 0,
         "dense_points": dense_map.points if dense_map is not None else 0,
-        "diagnostics": {
-            "internal": result.diagnostics,
-            "pipeline": pipeline_status,
-        },
+        "metrics": result.metrics,
+        "pipeline": pipeline_status,
     }
     manifest = output_dir / "manifest.json"
     summary["manifest"] = str(manifest)
@@ -221,12 +220,21 @@ def push_ready_lidar(
             pending_lidar.pop(0)
             continue
         scan_end = stamp if stamp_is_end else stamp + float(np.max(times))
-        if last_imu_stamp is None or last_imu_stamp <= scan_end + IMU_TIME_EPSILON_SECONDS:
+        if (
+            last_imu_stamp is None
+            or last_imu_stamp
+            <= scan_end + REQUIRED_TRAILING_IMU_SECONDS + IMU_TIME_EPSILON_SECONDS
+        ):
             if require_all:
-                raise RuntimeError(
-                    "not enough IMU after final lidar message "
-                    f"(last_imu={last_imu_stamp}, scan_end={scan_end})"
+                pending_lidar.pop(0)
+                print(
+                    "dropping final lidar message without required trailing IMU: "
+                    f"last_imu={last_imu_stamp}, scan_end={scan_end}, "
+                    f"required={REQUIRED_TRAILING_IMU_SECONDS}",
+                    file=sys.stderr,
+                    flush=True,
                 )
+                continue
             break
         pending_lidar.pop(0)
         ticket = slam.push_lidar(
@@ -236,13 +244,11 @@ def push_ready_lidar(
             intensities,
             stamp_is_end=stamp_is_end,
         )
-        try:
-            slam.wait_for_processed(ticket, PROCESSING_TIMEOUT_SECONDS)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"timed out waiting for Voxel-SLAM lidar ticket {ticket}; "
-                f"status={slam.status()}"
-            ) from exc
+        slam.wait_for_processed(
+            ticket,
+            PROCESSING_TIMEOUT_SECONDS,
+            allow_waiting_for_imu=not require_all,
+        )
         if dense_map is not None:
             dense_map.drain_from(slam)
         pushed += 1

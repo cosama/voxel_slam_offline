@@ -52,7 +52,6 @@ double imu_last_time = -1;
 int point_notime = 0;
 double last_pcl_time = -1;
 bool pl_ready = false;
-std::uint64_t ros_lidar_ticket = 0;
 std::uint64_t current_lidar_ticket = 0;
 
 void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in)
@@ -105,7 +104,6 @@ void pcl_handler(T &msg)
   mBuf.lock();
   time_buf.push_back(t0);
   pcl_buf.push_back(pl_ptr);
-  lidar_ticket_buf.push_back(++ros_lidar_ticket);
   mBuf.unlock();
 }
 
@@ -125,7 +123,6 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
     pcl_buf.pop_front(); time_buf.pop_front();
     if(!lidar_ticket_buf.empty()) lidar_ticket_buf.pop_front();
     mBuf.unlock();
-    voxelslam_offline::record_lidar_popped(current_lidar_ticket);
 
     p_imu.pcl_end_time = p_imu.pcl_beg_time + pl_ptr->back().curvature;
 
@@ -149,6 +146,7 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
   mBuf.lock();
   double last_imu_time = imu_last_time;
   mBuf.unlock();
+  voxelslam_offline::record_odometry_waiting_for_imu(current_lidar_ticket, pl_ready && last_imu_time <= p_imu.pcl_end_time);
   if(!pl_ready || last_imu_time <= p_imu.pcl_end_time) return false;
 
   mBuf.lock();
@@ -158,17 +156,14 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
     return false;
   }
   double imu_time = imu_buf.front()->header.stamp.toSec();
-  std::size_t consumed_imu = 0;
   while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
   {
     imu_time = imu_buf.front()->header.stamp.toSec();
     if(imu_time > p_imu.pcl_end_time) break;
     imus.push_back(imu_buf.front());
     imu_buf.pop_front();
-    consumed_imu++;
   }
   mBuf.unlock();
-  voxelslam_offline::record_imu_consumed(consumed_imu);
 
   if(imu_buf.empty())
   {
@@ -181,7 +176,7 @@ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::I
     return true;
   else
   {
-    voxelslam_offline::record_lidar_skipped_insufficient_imu(current_lidar_ticket);
+    voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
     return false;
   }
 }

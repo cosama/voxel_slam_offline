@@ -533,7 +533,7 @@ public:
     int g_size = voxhess.plvec_voxels.size();
     if(g_size < thd_num)
     {
-      // printf("Too Less Voxel");
+      // printf("Too Less Voxel"); exit(0);
       thd_num = 1;
     }
     vector<thread*> mthreads(thd_num, nullptr);
@@ -746,7 +746,7 @@ public:
     int g_size = voxhess.plvec_voxels.size();
     if(g_size < thd_num)
     {
-      // printf("Too Less Voxel");
+      // printf("Too Less Voxel"); exit(0);
       thd_num = 1;
     }
     vector<thread*> mthreads(thd_num, nullptr);

@@ -67,13 +67,13 @@ without calling `finish()`:
 ```python
 pose = slam.latest_pose()    # shape (8,), or None before the first pose
 path = slam.trajectory()     # best available Nx8 trajectory
-diagnostics = slam.diagnostics()  # aggregate counters and fit summaries
+metrics = slam.metrics()  # aggregate counters and fit summaries
 status = slam.status()       # queue depths, tickets, and worker lifecycle state
 scans = slam.pop_deskewed_scans()  # list of Nx5 stamp,x,y,z,intensity arrays
 ```
 
-`finish()` is only for shutdown. `result.diagnostics` returns the final
-aggregate diagnostics without per-frame logs.
+`finish()` is only for shutdown. `result.metrics` returns the final aggregate
+metrics without per-frame logs.
 
 Transforms are 4x4 homogeneous matrices. If the surrounding application has an
 IMU-to-lidar transform instead, pass it as `imu_to_lidar`; the wrapper inverts

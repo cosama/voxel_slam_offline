@@ -46,7 +46,7 @@ struct ScalarStats {
   }
 };
 
-struct Diagnostics {
+struct Metrics {
   std::uint64_t odometry_degrade_resets = 0;
 
   std::uint64_t loop_candidates = 0;
@@ -67,12 +67,6 @@ struct Diagnostics {
   ScalarStats loop_drift_ratio;
   ScalarStats loop_graph_pose_count;
 
-  std::uint64_t hba_runs = 0;
-  std::uint64_t hba_converged = 0;
-  ScalarStats hba_window_size;
-  ScalarStats hba_voxels;
-  ScalarStats hba_residual_improvement;
-
   std::uint64_t gba_started = 0;
   std::uint64_t gba_completed = 0;
   ScalarStats gba_keyframes;
@@ -84,19 +78,13 @@ struct Diagnostics {
 
 struct PipelineStatus {
   std::uint64_t latest_imu_ticket = 0;
-  std::uint64_t imu_consumed = 0;
   std::uint64_t latest_lidar_ticket = 0;
-  std::uint64_t latest_lidar_popped_ticket = 0;
   std::uint64_t latest_lidar_processed_ticket = 0;
   std::uint64_t lidar_completed = 0;
   std::uint64_t lidar_completed_with_pose = 0;
   std::uint64_t lidar_completed_without_pose = 0;
-  std::uint64_t lidar_skipped_initializing = 0;
-  std::uint64_t lidar_skipped_imu_process = 0;
-  std::uint64_t lidar_skipped_insufficient_imu = 0;
-  std::uint64_t loop_scanposes_queued = 0;
-  std::uint64_t loop_scanposes_popped = 0;
-  std::uint64_t loop_scanposes_integrated = 0;
+  bool odometry_waiting_for_imu = false;
+  std::uint64_t odometry_waiting_lidar_ticket = 0;
   bool odometry_thread_finished = false;
   bool loop_thread_finished = false;
   bool gba_thread_finished = false;
@@ -106,12 +94,9 @@ struct Recorder {
   std::mutex mutex;
   std::vector<PoseRecord> poses;
   std::vector<PoseRecord> optimized_poses;
-  std::vector<PointRecord> map_points;
   std::deque<std::vector<PointRecord>> deskewed_scans;
-  Diagnostics diagnostics;
+  Metrics metrics;
   PipelineStatus pipeline;
-  bool collect_map = false;
-  std::size_t max_map_points = 0;
   bool emit_deskewed_points = false;
 };
 
@@ -120,19 +105,14 @@ Recorder& recorder() {
   return instance;
 }
 
-void reset_records(bool collect_map,
-                   std::size_t max_map_points,
-                   bool emit_deskewed_points) {
+void reset_records(bool emit_deskewed_points) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   std::vector<PoseRecord>().swap(rec.poses);
   std::vector<PoseRecord>().swap(rec.optimized_poses);
-  std::vector<PointRecord>().swap(rec.map_points);
   rec.deskewed_scans.clear();
-  rec.diagnostics = Diagnostics();
+  rec.metrics = Metrics();
   rec.pipeline = PipelineStatus();
-  rec.collect_map = collect_map;
-  rec.max_map_points = max_map_points;
   rec.emit_deskewed_points = emit_deskewed_points;
 }
 
@@ -148,22 +128,10 @@ void record_imu_pushed(std::uint64_t ticket) {
   rec.pipeline.latest_imu_ticket = std::max(rec.pipeline.latest_imu_ticket, ticket);
 }
 
-void record_imu_consumed(std::size_t count) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.imu_consumed += count;
-}
-
 void record_lidar_pushed(std::uint64_t ticket) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   rec.pipeline.latest_lidar_ticket = std::max(rec.pipeline.latest_lidar_ticket, ticket);
-}
-
-void record_lidar_popped(std::uint64_t ticket) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_lidar_popped_ticket = std::max(rec.pipeline.latest_lidar_popped_ticket, ticket);
 }
 
 void record_lidar_processed(std::uint64_t ticket, bool pose_recorded) {
@@ -178,56 +146,11 @@ void record_lidar_processed(std::uint64_t ticket, bool pose_recorded) {
   }
 }
 
-void record_lidar_skipped_initializing(std::uint64_t ticket) {
+void record_odometry_waiting_for_imu(std::uint64_t ticket, bool waiting) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_lidar_processed_ticket = std::max(rec.pipeline.latest_lidar_processed_ticket, ticket);
-  ++rec.pipeline.lidar_completed;
-  ++rec.pipeline.lidar_completed_without_pose;
-  ++rec.pipeline.lidar_skipped_initializing;
-}
-
-void record_lidar_skipped_imu_process(std::uint64_t ticket) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_lidar_processed_ticket = std::max(rec.pipeline.latest_lidar_processed_ticket, ticket);
-  ++rec.pipeline.lidar_completed;
-  ++rec.pipeline.lidar_completed_without_pose;
-  ++rec.pipeline.lidar_skipped_imu_process;
-}
-
-void record_lidar_skipped_insufficient_imu(std::uint64_t ticket) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_lidar_processed_ticket = std::max(rec.pipeline.latest_lidar_processed_ticket, ticket);
-  ++rec.pipeline.lidar_completed;
-  ++rec.pipeline.lidar_completed_without_pose;
-  ++rec.pipeline.lidar_skipped_insufficient_imu;
-}
-
-void record_loop_scanpose_queued() {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.pipeline.loop_scanposes_queued;
-}
-
-void record_loop_scanpose_popped() {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.pipeline.loop_scanposes_popped;
-}
-
-void record_loop_scanpose_integrated() {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.pipeline.loop_scanposes_integrated;
-}
-
-void record_loop_scanposes_transferred(std::size_t count) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.loop_scanposes_popped += count;
-  rec.pipeline.loop_scanposes_integrated += count;
+  rec.pipeline.odometry_waiting_for_imu = waiting;
+  rec.pipeline.odometry_waiting_lidar_ticket = ticket;
 }
 
 void record_odometry_thread_finished() {
@@ -269,18 +192,6 @@ void record_optimized_poses(const std::vector<PoseRecord>& poses) {
   rec.optimized_poses = poses;
 }
 
-void record_map_point(double stamp, float x, float y, float z, float intensity) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  if (!rec.collect_map) {
-    return;
-  }
-  if (rec.max_map_points != 0 && rec.map_points.size() >= rec.max_map_points) {
-    return;
-  }
-  rec.map_points.push_back({stamp, x, y, z, intensity});
-}
-
 void record_dense_deskewed_points(const std::vector<PointRecord>& points) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
@@ -293,20 +204,20 @@ void record_dense_deskewed_points(const std::vector<PointRecord>& points) {
 void record_odometry_degrade_reset() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.odometry_degrade_resets;
+  ++rec.metrics.odometry_degrade_resets;
 }
 
 void record_loop_candidate(double score) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.loop_candidates;
-  rec.diagnostics.loop_score.observe(score);
+  ++rec.metrics.loop_candidates;
+  rec.metrics.loop_score.observe(score);
 }
 
 void record_loop_score_passed() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.loop_score_passed;
+  ++rec.metrics.loop_score_passed;
 }
 
 void record_loop_icp_result(double eig0,
@@ -317,7 +228,7 @@ void record_loop_icp_result(double eig0,
                             int match_count) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  auto& d = rec.diagnostics;
+  auto& d = rec.metrics;
   if (converged) {
     ++d.loop_icp_converged;
   }
@@ -336,53 +247,37 @@ void record_loop_drift_ratio(double ratio, bool passed) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   if (passed) {
-    ++rec.diagnostics.loop_drift_passed;
+    ++rec.metrics.loop_drift_passed;
   } else {
-    ++rec.diagnostics.loop_drift_rejected;
+    ++rec.metrics.loop_drift_rejected;
   }
-  rec.diagnostics.loop_drift_ratio.observe(ratio);
+  rec.metrics.loop_drift_ratio.observe(ratio);
 }
 
 void record_loop_edge_added() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.loop_edges_added;
+  ++rec.metrics.loop_edges_added;
 }
 
 void record_loop_graph_optimization(std::size_t pose_count) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.loop_graph_optimizations;
-  rec.diagnostics.loop_graph_pose_count.observe(static_cast<double>(pose_count));
+  ++rec.metrics.loop_graph_optimizations;
+  rec.metrics.loop_graph_pose_count.observe(static_cast<double>(pose_count));
 }
 
 void record_loop_update_applied() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.loop_updates_applied;
-}
-
-void record_hba_fit(int window_size,
-                    std::size_t voxel_count,
-                    double residual_improvement,
-                    bool converged) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  auto& d = rec.diagnostics;
-  ++d.hba_runs;
-  if (converged) {
-    ++d.hba_converged;
-  }
-  d.hba_window_size.observe(window_size);
-  d.hba_voxels.observe(static_cast<double>(voxel_count));
-  d.hba_residual_improvement.observe(residual_improvement);
+  ++rec.metrics.loop_updates_applied;
 }
 
 void record_gba_started(int keyframes) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  ++rec.diagnostics.gba_started;
-  rec.diagnostics.gba_keyframes.observe(keyframes);
+  ++rec.metrics.gba_started;
+  rec.metrics.gba_keyframes.observe(keyframes);
 }
 
 void record_gba_completed(double runtime_seconds,
@@ -391,7 +286,7 @@ void record_gba_completed(double runtime_seconds,
                           std::size_t stage2_edges) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  auto& d = rec.diagnostics;
+  auto& d = rec.metrics;
   ++d.gba_completed;
   d.gba_runtime_seconds.observe(runtime_seconds);
   d.gba_pose_count.observe(static_cast<double>(pose_count));
@@ -426,12 +321,6 @@ std::vector<PoseRecord> snapshot_best_poses() {
   return best_poses(rec);
 }
 
-std::vector<PointRecord> take_map_points() {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  return std::move(rec.map_points);
-}
-
 std::vector<std::vector<PointRecord>> take_deskewed_scans() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
@@ -444,10 +333,10 @@ std::vector<std::vector<PointRecord>> take_deskewed_scans() {
   return scans;
 }
 
-Diagnostics snapshot_diagnostics() {
+Metrics snapshot_metrics() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  return rec.diagnostics;
+  return rec.metrics;
 }
 
 PipelineStatus snapshot_pipeline_status() {
@@ -508,8 +397,6 @@ struct VoxelSlamOptions {
   std::vector<double> gba_eigen_value_array = {9.0, 9.0, 9.0, 9.0};
   int gba_total_max_iter = 3;
 
-  bool collect_map = false;
-  std::size_t max_map_points = 0;
   bool emit_deskewed_points = false;
   bool enable_loop_closure = true;
   bool enable_global_mapping = true;
@@ -517,8 +404,7 @@ struct VoxelSlamOptions {
 
 struct Result {
   std::vector<voxelslam_offline::PoseRecord> poses;
-  std::vector<voxelslam_offline::PointRecord> map_points;
-  voxelslam_offline::Diagnostics diagnostics;
+  voxelslam_offline::Metrics metrics;
 };
 
 static py::array_t<double> poses_to_array(const std::vector<voxelslam_offline::PoseRecord>& poses) {
@@ -589,7 +475,7 @@ static py::dict scalar_stats_to_dict(const voxelslam_offline::ScalarStats& stats
   return out;
 }
 
-static py::dict diagnostics_to_dict(const voxelslam_offline::Diagnostics& d) {
+static py::dict metrics_to_dict(const voxelslam_offline::Metrics& d) {
   py::dict out;
 
   py::dict odometry;
@@ -616,14 +502,6 @@ static py::dict diagnostics_to_dict(const voxelslam_offline::Diagnostics& d) {
   loop["graph_pose_count"] = scalar_stats_to_dict(d.loop_graph_pose_count);
   out["loop_closure"] = loop;
 
-  py::dict hba;
-  hba["runs"] = d.hba_runs;
-  hba["converged"] = d.hba_converged;
-  hba["window_size"] = scalar_stats_to_dict(d.hba_window_size);
-  hba["voxels"] = scalar_stats_to_dict(d.hba_voxels);
-  hba["residual_improvement"] = scalar_stats_to_dict(d.hba_residual_improvement);
-  out["hierarchical_ba"] = hba;
-
   py::dict gba;
   gba["started"] = d.gba_started;
   gba["completed"] = d.gba_completed;
@@ -647,27 +525,24 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
 
   py::dict imu;
   imu["latest_ticket"] = status.latest_imu_ticket;
-  imu["consumed"] = status.imu_consumed;
   imu["pending_queue"] = pending_imu;
   out["imu"] = imu;
 
   py::dict lidar;
   lidar["latest_ticket"] = status.latest_lidar_ticket;
-  lidar["latest_popped_ticket"] = status.latest_lidar_popped_ticket;
   lidar["latest_processed_ticket"] = status.latest_lidar_processed_ticket;
   lidar["completed"] = status.lidar_completed;
   lidar["completed_with_pose"] = status.lidar_completed_with_pose;
   lidar["completed_without_pose"] = status.lidar_completed_without_pose;
-  lidar["skipped_initializing"] = status.lidar_skipped_initializing;
-  lidar["skipped_imu_process"] = status.lidar_skipped_imu_process;
-  lidar["skipped_insufficient_imu"] = status.lidar_skipped_insufficient_imu;
   lidar["pending_queue"] = pending_lidar;
   out["lidar"] = lidar;
 
+  py::dict odometry;
+  odometry["waiting_for_imu"] = status.odometry_waiting_for_imu;
+  odometry["waiting_lidar_ticket"] = status.odometry_waiting_lidar_ticket;
+  out["odometry"] = odometry;
+
   py::dict loop;
-  loop["scanposes_queued"] = status.loop_scanposes_queued;
-  loop["scanposes_popped"] = status.loop_scanposes_popped;
-  loop["scanposes_integrated"] = status.loop_scanposes_integrated;
   loop["pending_queue"] = pending_loop_scanposes;
   out["loop"] = loop;
 
@@ -689,9 +564,7 @@ class VoxelSlam {
     validate_options(options_);
     std::filesystem::create_directories(options_.save_path);
     reset_upstream_buffers();
-    voxelslam_offline::reset_records(options_.collect_map,
-                                     options_.max_map_points,
-                                     options_.emit_deskewed_points);
+    voxelslam_offline::reset_records(options_.emit_deskewed_points);
     configure_node(options_);
 
     slam_ = std::make_unique<VOXEL_SLAM>(node_);
@@ -872,8 +745,7 @@ class VoxelSlam {
     }
 
     result_.poses = voxelslam_offline::take_poses();
-    result_.map_points = voxelslam_offline::take_map_points();
-    result_.diagnostics = voxelslam_offline::snapshot_diagnostics();
+    result_.metrics = voxelslam_offline::snapshot_metrics();
     finished_ = true;
     throw_if_thread_error();
     return result_;
@@ -904,9 +776,9 @@ class VoxelSlam {
     return poses_to_array(current_poses());
   }
 
-  py::dict diagnostics() const {
+  py::dict metrics() const {
     throw_if_thread_error();
-    return diagnostics_to_dict(voxelslam_offline::snapshot_diagnostics());
+    return metrics_to_dict(voxelslam_offline::snapshot_metrics());
   }
 
   py::dict status() const {
@@ -1118,7 +990,6 @@ class VoxelSlam {
     imu_last_time = -1.0;
     last_pcl_time = -1.0;
     current_lidar_ticket = 0;
-    ros_lidar_ticket = 0;
     pl_ready = false;
     point_notime = 0;
   }
@@ -1189,8 +1060,6 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("gba_min_eigen_value", &VoxelSlamOptions::gba_min_eigen_value)
       .def_readwrite("gba_eigen_value_array", &VoxelSlamOptions::gba_eigen_value_array)
       .def_readwrite("gba_total_max_iter", &VoxelSlamOptions::gba_total_max_iter)
-      .def_readwrite("collect_map", &VoxelSlamOptions::collect_map)
-      .def_readwrite("max_map_points", &VoxelSlamOptions::max_map_points)
       .def_readwrite("emit_deskewed_points", &VoxelSlamOptions::emit_deskewed_points)
       .def_readwrite("enable_loop_closure", &VoxelSlamOptions::enable_loop_closure)
       .def_readwrite("enable_global_mapping", &VoxelSlamOptions::enable_global_mapping);
@@ -1199,11 +1068,8 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("trajectory", [](const Result& result) {
         return poses_to_array(result.poses);
       })
-      .def_property_readonly("map_points", [](const Result& result) {
-        return points_to_array(result.map_points);
-      })
-      .def_property_readonly("diagnostics", [](const Result& result) {
-        return diagnostics_to_dict(result.diagnostics);
+      .def_property_readonly("metrics", [](const Result& result) {
+        return metrics_to_dict(result.metrics);
       });
 
   py::class_<VoxelSlam>(m, "VoxelSlam")
@@ -1221,7 +1087,7 @@ PYBIND11_MODULE(_core, m) {
            py::arg("stamp_is_end") = false)
       .def("latest_pose", &VoxelSlam::latest_pose)
       .def("trajectory", &VoxelSlam::trajectory)
-      .def("diagnostics", &VoxelSlam::diagnostics)
+      .def("metrics", &VoxelSlam::metrics)
       .def("status", &VoxelSlam::status)
       .def_property_readonly("latest_imu_ticket", &VoxelSlam::latest_imu_ticket)
       .def_property_readonly("latest_lidar_ticket", &VoxelSlam::latest_lidar_ticket)

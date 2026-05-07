@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ._core import Result, VoxelSlam as _CoreVoxelSlam
@@ -88,10 +89,10 @@ class VoxelSlam:
 
         return self._core.trajectory()
 
-    def diagnostics(self) -> dict[str, Any]:
-        """Return aggregate internal diagnostics collected so far."""
+    def metrics(self) -> dict[str, Any]:
+        """Return aggregate SLAM metrics collected so far."""
 
-        return self._core.diagnostics()
+        return self._core.metrics()
 
     def status(self) -> dict[str, Any]:
         """Return queue depths, tickets, and worker lifecycle state."""
@@ -110,8 +111,35 @@ class VoxelSlam:
         self,
         ticket: int | None = None,
         timeout_seconds: float = -1.0,
+        *,
+        allow_waiting_for_imu: bool = False,
     ) -> None:
-        self._core.wait_for_processed(0 if ticket is None else ticket, timeout_seconds)
+        target = 0 if ticket is None else ticket
+        if not allow_waiting_for_imu:
+            self._core.wait_for_processed(target, timeout_seconds)
+            return
+        if target == 0:
+            target = self.latest_lidar_ticket
+            if target == 0:
+                return
+
+        deadline = None if timeout_seconds < 0.0 else time.monotonic() + timeout_seconds
+        while True:
+            status = self.status()
+            if int(status["lidar"]["latest_processed_ticket"]) >= target:
+                return
+            odometry = status.get("odometry", {})
+            if (
+                odometry.get("waiting_for_imu", False)
+                and 0 < int(odometry.get("waiting_lidar_ticket", 0)) <= target
+            ):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"timed out waiting for Voxel-SLAM lidar ticket {target}; "
+                    f"status={status}"
+                )
+            time.sleep(0.001)
 
     def pop_deskewed_scans(self) -> list[Any]:
         """Return and clear pending deskewed scan batches.

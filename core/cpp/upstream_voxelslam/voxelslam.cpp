@@ -2,9 +2,6 @@
 
 #include <voxelslam/offline_bridge.hpp>
 
-#include <fstream>
-#include <iomanip>
-
 using namespace std;
 
 class ResultOutput
@@ -50,7 +47,6 @@ public:
       ap.y = pvec.y();
       ap.z = pvec.z();
       pcl_send.push_back(ap);
-      voxelslam_offline::record_map_point(x_curr.t, ap.x, ap.y, ap.z, 0.0f);
     }
     pub_pl_func(pcl_send, pub_scan);
     
@@ -96,39 +92,11 @@ public:
     pub_pl_func(pcl_send, pub_cmap);
   }
 
-  void record_dense_deskewed_scan(pcl::PointCloud<PointType> &scan, IMUST &x_scan_end, IMUST &extrin_para)
-  {
-    (void)extrin_para;
-    if(!voxelslam_offline::is_emitting_deskewed_points() || scan.empty())
-      return;
-
-    double max_offset = 0.0;
-    for(PointType &ap: scan.points)
-      if(std::isfinite(ap.curvature))
-        max_offset = std::max(max_offset, static_cast<double>(ap.curvature));
-    double scan_start_time = x_scan_end.t - max_offset;
-
-    vector<voxelslam_offline::PointRecord> points;
-    points.reserve(scan.size());
-    for(PointType &ap: scan.points)
-    {
-      points.push_back({
-          scan_start_time + static_cast<double>(ap.curvature),
-          ap.x,
-          ap.y,
-          ap.z,
-          ap.intensity,
-      });
-    }
-    voxelslam_offline::record_dense_deskewed_points(points);
-  }
-
-  void pub_global_path(vector<vector<ScanPose*>*> &relc_bl_buf, ros::Publisher &pub_relc, vector<int> &ids, bool record_optimized = false)
+  void pub_global_path(vector<vector<ScanPose*>*> &relc_bl_buf, ros::Publisher &pub_relc, vector<int> &ids)
   {
     pcl::PointCloud<pcl::PointXYZI> pl;
     pcl::PointXYZI pp;
     int idsize = ids.size();
-    vector<voxelslam_offline::PoseRecord> poses;
 
     for(int i=0; i<idsize; i++)
     {
@@ -137,15 +105,8 @@ public:
       {
         pp.x = bl->x.p[0]; pp.y = bl->x.p[1]; pp.z = bl->x.p[2];
         pl.push_back(pp);
-        if(record_optimized)
-        {
-          Eigen::Quaterniond q(bl->x.R);
-          poses.push_back({bl->x.t, bl->x.p.x(), bl->x.p.y(), bl->x.p.z(), q.x(), q.y(), q.z(), q.w()});
-        }
       }
     }
-    if(record_optimized)
-      voxelslam_offline::record_optimized_poses(poses);
     pub_pl_func(pl, pub_relc);
   }
 
@@ -1294,7 +1255,7 @@ public:
     var_init(extrin_para, *pcl_curr, pptr, dept_err, beam_err);
     lio_state_estimation_kdtree(pptr);
     if(dense_deskewed_scan)
-      ResultOutput::instance().record_dense_deskewed_scan(*dense_deskewed_scan, x_curr, extrin_para);
+      voxelslam_offline::record_dense_deskewed_scan(*dense_deskewed_scan, x_curr, extrin_para);
 
     pwld.clear();
     pvec_update(pptr, x_curr, pwld);
@@ -1588,9 +1549,8 @@ public:
         sleep(0.001);
         continue;
       }
-      bool lidar_classified = false;
-
       static int first_flag = 1;
+      bool lidar_processed = false;
       if (first_flag)
       {
         pcl::PointCloud<PointType> pl;
@@ -1610,14 +1570,13 @@ public:
         {
           motion_init_flag = 0;
           voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
-          lidar_classified = true;
+          lidar_processed = true;
         }
         else
         {
           if(init == -1)
             system_reset(imus);
-          voxelslam_offline::record_lidar_skipped_initializing(current_lidar_ticket);
-          lidar_classified = true;
+          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
           continue;
         }
       }
@@ -1625,8 +1584,7 @@ public:
       {
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
         {
-          voxelslam_offline::record_lidar_skipped_imu_process(current_lidar_ticket);
-          lidar_classified = true;
+          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
           continue;
         }
 
@@ -1649,7 +1607,7 @@ public:
         else
           degrade_cnt++;
 
-        ResultOutput::instance().record_dense_deskewed_scan(*pcl_curr, x_curr, extrin_para);
+        voxelslam_offline::record_dense_deskewed_scan(*pcl_curr, x_curr, extrin_para);
 
         pwld.clear();
         pvec_update(pptr, x_curr, pwld);
@@ -1693,7 +1651,6 @@ public:
           history_kfsize = 0;
 
           voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
-          lidar_classified = true;
           continue;
         }
       }
@@ -1723,7 +1680,6 @@ public:
         mtx_loop.lock();
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
-        voxelslam_offline::record_loop_scanpose_queued();
 
         x_curr.R = x_buf[win_count-1].R;
         x_curr.p = x_buf[win_count-1].p;
@@ -1776,7 +1732,7 @@ public:
 
         win_base += mgsize; win_count -= mgsize;
       }
-      if(!lidar_classified)
+      if(!lidar_processed)
         voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
       
       double t_end = ros::Time::now().toSec();
@@ -1923,7 +1879,6 @@ public:
       if(reset_flag == 1)
       {
         reset_flag = 0;
-        voxelslam_offline::record_loop_scanposes_transferred(buf_lba2loop_tem.size());
         scanPoses->insert(scanPoses->end(), buf_lba2loop_tem.begin(), buf_lba2loop_tem.end());
         for(ScanPose *bl: buf_lba2loop_tem) bl->pvec = nullptr;
         buf_lba2loop_tem.clear();
@@ -1969,14 +1924,12 @@ public:
       {
         bl_head = buf_lba2loop.front();
         buf_lba2loop.pop_front();
-        voxelslam_offline::record_loop_scanpose_popped();
       }
       mtx_loop.unlock();
       if(bl_head == nullptr) continue;
 
       int cur_id = std_managers.size() - 1;
       scanPoses->push_back(bl_head);
-      voxelslam_offline::record_loop_scanpose_integrated();
       bl_local.push_back(bl_head);
       IMUST xc = bl_head->x;
       gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
@@ -2068,8 +2021,7 @@ public:
         if(search_result.first >= 0 && search_result.second > juds[id])
         {
           voxelslam_offline::record_loop_score_passed();
-          bool icp_ok = icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval);
-          if(icp_ok)
+          if(icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval))
           {
             int ord_bl = std_managers[id]->plane_cloud_vec_[search_result.first]->header.seq;
 
@@ -2391,7 +2343,8 @@ public:
         smp->x0 = multimap_scanPoses[tip]->at(smp->id)->x;
     }
 
-    ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids, true);
+    ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
+    voxelslam_offline::record_optimized_path(multimap_scanPoses, ids);
     vector<int> ids2 = ids; ids2.pop_back();
     ResultOutput::instance().pub_globalmap(multimap_keyframes, ids2, pub_pmap);
     ids2.clear(); ids2.push_back(ids.back());
@@ -2464,8 +2417,6 @@ public:
       opt_lsv.thd_num = thread_num;
       vector<double> resis;
       bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
-      if(resis.size() >= 2 && resis[0] != 0)
-        voxelslam_offline::record_hba_fit(wdsize, voxhess.plvec_voxels.size(), fabs(resis[0] - resis[1]) / fabs(resis[0]), is_converge);
       if(is_display)
         printf("%lf\n", fabs(resis[0] - resis[1]) / resis[0]);
       if((fabs(resis[0] - resis[1]) / resis[0] < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
@@ -2680,7 +2631,6 @@ public:
 
 };
 
-#ifndef VOXELSLAM_PYTHON_MODULE
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "cmn_voxel");
@@ -2707,4 +2657,3 @@ int main(int argc, char **argv)
   thread_gba.join();
   ros::spin(); return 0;
 }
-#endif
