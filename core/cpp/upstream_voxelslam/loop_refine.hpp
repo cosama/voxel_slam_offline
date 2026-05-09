@@ -56,6 +56,9 @@ bool icp_normal(pcl::PointCloud<PointType> &pl_src, pcl::PointCloud<PointType> &
     pi.x = ap.x; pi.y = ap.y; pi.z = ap.z;
     input_cloud.push_back(pi);
   }
+  if (pl_src.empty() || input_cloud.empty()) {
+    return false;
+  }
   kd_tree.setInputCloud(input_cloud.makeShared());
 
   vector<int> pointIdxNKNSearch(1);

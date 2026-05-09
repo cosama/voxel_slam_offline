@@ -340,18 +340,16 @@ public:
     // voxhess.evaluate_only_residual(x_stats, 0, voxhess.plvec_voxels.size(), residual1);
 
     // int thd_num = 2;
-    vector<double> residuals(thd_num, 0);
+    int tthd_num = thd_num;
     int g_size = voxhess.plvec_voxels.size();
-    if(g_size < thd_num)
-    {
-      throw std::runtime_error("Too Less Voxel");
-    }
-    vector<thread*> mthreads(thd_num, nullptr);
-    double part = 1.0 * g_size / thd_num;
-    for(int i=1; i<thd_num; i++)
+    if(g_size < tthd_num) tthd_num = 1;
+    vector<double> residuals(tthd_num, 0);
+    vector<thread*> mthreads(tthd_num, nullptr);
+    double part = 1.0 * g_size / tthd_num;
+    for(int i=1; i<tthd_num; i++)
       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
 
-    for(int i=0; i<thd_num; i++)
+    for(int i=0; i<tthd_num; i++)
     {
       if(i != 0) 
         mthreads[i]->join();
@@ -413,9 +411,9 @@ public:
 
       q = (residual1-residual2);
       if(is_display)
-        printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, q/q1, q1, q);
+        printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, fabs(q1) > 1e-12 ? q / q1 : 0.0, q1, q);
 
-      if(q > 0)
+      if(q > 0 && fabs(q1) > 1e-12)
       {
         x_stats = x_stats_temp;
         double one_three = 1.0 / 3;
@@ -434,7 +432,7 @@ public:
         is_converge = false;
       }
 
-      if(fabs((residual1-residual2)/residual1)<1e-6)
+      if(fabs(residual1) > 1e-12 && fabs((residual1-residual2)/residual1)<1e-6)
         break;
     }
     resis.push_back(residual2);
@@ -1520,7 +1518,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     {
       iter->second->allocate(win_count, pv, pw, sws);
       iter->second->isexist = true;
-      if(feat_tem_map.find(position) == feat_map.end())
+      if(feat_tem_map.find(position) == feat_tem_map.end())
         feat_tem_map[position] = iter->second;
     }
     else
@@ -1561,7 +1559,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
     if(iter != feat_map.end())
     {
       iter->second->isexist = true;
-      if(feat_tem_map.find(position) == feat_map.end())
+      if(feat_tem_map.find(position) == feat_tem_map.end())
         feat_tem_map[position] = iter->second;
       ot = iter->second;
     }

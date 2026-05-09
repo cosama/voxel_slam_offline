@@ -126,7 +126,18 @@ class VoxelSlam:
         deadline = None if timeout_seconds < 0.0 else time.monotonic() + timeout_seconds
         while True:
             status = self.status()
-            if int(status["lidar"]["latest_processed_ticket"]) >= target:
+            workers = status.get("workers", {})
+            loop = status.get("loop", {})
+            loop_idle = (
+                not workers.get("loop_enabled", True)
+                or (
+                    int(loop.get("pending_queue", 0)) == 0
+                    and not bool(loop.get("processing", False))
+                    and not bool(loop.get("update_pending", False))
+                    and not bool(loop.get("reset_pending", False))
+                )
+            )
+            if int(status["lidar"]["latest_processed_ticket"]) >= target and loop_idle:
                 return
             odometry = status.get("odometry", {})
             if (

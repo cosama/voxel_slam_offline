@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <string>
 #include <vector>
 
 namespace voxelslam_offline {
@@ -30,13 +31,20 @@ struct PointRecord {
   float intensity = 0.0f;
 };
 
+struct EventRecord {
+  std::string type;
+  double stamp = 0.0;
+  std::uint64_t lidar_ticket = 0;
+  std::string reason;
+};
+
 bool is_emitting_deskewed_points();
 void record_lidar_processed(std::uint64_t ticket, bool pose_recorded);
 void record_odometry_waiting_for_imu(std::uint64_t ticket, bool waiting);
 void record_pose(double stamp, const Eigen::Vector3d& position, const Eigen::Quaterniond& orientation);
 void record_optimized_poses(const std::vector<PoseRecord>& poses);
 void record_dense_deskewed_points(const std::vector<PointRecord>& points);
-void record_odometry_degrade_reset();
+void record_odometry_reset(double stamp, std::uint64_t lidar_ticket, const std::string& reason);
 void record_loop_candidate(double score);
 void record_loop_score_passed();
 void record_loop_icp_result(double eig0,

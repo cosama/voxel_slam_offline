@@ -6,6 +6,7 @@
 #include "feature_point.hpp"
 #include "loop_refine.hpp"
 #include <voxelslam/offline_bridge.hpp>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <Eigen/Eigenvalues>

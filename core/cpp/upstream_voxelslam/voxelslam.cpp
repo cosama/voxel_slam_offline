@@ -739,15 +739,16 @@ public:
   mutex mtx_loop;
   deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
   vector<Keyframe*> *keyframes;
-  int loop_detect = 0;
+  std::atomic<int> loop_detect{0};
+  std::atomic<int> loop_processing{0};
   unordered_map<VOXEL_LOC, OctoTree*> map_loop;
   IMUST dx;
   pcl::PointCloud<PointType>::Ptr pl_kdmap;
   pcl::KdTreeFLANN<PointType> kd_keyframes;
   int history_kfsize = 0;
   vector<OctoTree*> octos_release;
-  int reset_flag = 0;
-  int g_update = 0;
+  std::atomic<int> reset_flag{0};
+  std::atomic<int> g_update{0};
   int thread_num = 5;
   int degrade_bound = 10;
 
@@ -1575,7 +1576,11 @@ public:
         else
         {
           if(init == -1)
+          {
+            voxelslam_offline::record_odometry_reset(
+                odom_ekf.pcl_beg_time, current_lidar_ticket, "initialization_failed");
             system_reset(imus);
+          }
           voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
           continue;
         }
@@ -1636,7 +1641,8 @@ public:
 
         if(degrade_cnt > degrade_bound)
         {
-          voxelslam_offline::record_odometry_degrade_reset();
+          voxelslam_offline::record_odometry_reset(
+              x_curr.t, current_lidar_ticket, "degrade_bound");
           degrade_cnt = 0;
           system_reset(imus);
 
@@ -1924,9 +1930,18 @@ public:
       {
         bl_head = buf_lba2loop.front();
         buf_lba2loop.pop_front();
+        loop_processing = 1;
       }
       mtx_loop.unlock();
       if(bl_head == nullptr) continue;
+      struct LoopProcessingGuard
+      {
+        VOXEL_SLAM *slam;
+        ~LoopProcessingGuard()
+        {
+          slam->loop_processing = 0;
+        }
+      } loop_processing_guard{this};
 
       int cur_id = std_managers.size() - 1;
       scanPoses->push_back(bl_head);
@@ -2383,6 +2398,8 @@ public:
     }
     
     int wdsize = smps.size();
+    if(wdsize < 2)
+      return;
     Eigen::MatrixXd hess;
     vector<double> gba_eigen_value_array_orig = gba_eigen_value_array;
     double gba_min_eigen_value_orig = gba_min_eigen_value;
@@ -2417,9 +2434,10 @@ public:
       opt_lsv.thd_num = thread_num;
       vector<double> resis;
       bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
+      double residual_change = resis.size() >= 2 && fabs(resis[0]) > 1e-12 ? fabs(resis[0] - resis[1]) / fabs(resis[0]) : 0.0;
       if(is_display)
-        printf("%lf\n", fabs(resis[0] - resis[1]) / resis[0]);
-      if((fabs(resis[0] - resis[1]) / resis[0] < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
+        printf("%lf\n", residual_change);
+      if((residual_change < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
       {
         converge_thre = 0.01;
         if(converge_flag == 0)

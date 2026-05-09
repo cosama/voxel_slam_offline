@@ -6,14 +6,16 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
-#include <exception>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -94,6 +96,7 @@ struct Recorder {
   std::mutex mutex;
   std::vector<PoseRecord> poses;
   std::vector<PoseRecord> optimized_poses;
+  std::vector<EventRecord> events;
   std::deque<std::vector<PointRecord>> deskewed_scans;
   Metrics metrics;
   PipelineStatus pipeline;
@@ -110,6 +113,7 @@ void reset_records(bool emit_deskewed_points) {
   std::lock_guard<std::mutex> lock(rec.mutex);
   std::vector<PoseRecord>().swap(rec.poses);
   std::vector<PoseRecord>().swap(rec.optimized_poses);
+  std::vector<EventRecord>().swap(rec.events);
   rec.deskewed_scans.clear();
   rec.metrics = Metrics();
   rec.pipeline = PipelineStatus();
@@ -201,10 +205,11 @@ void record_dense_deskewed_points(const std::vector<PointRecord>& points) {
   rec.deskewed_scans.push_back(points);
 }
 
-void record_odometry_degrade_reset() {
+void record_odometry_reset(double stamp, std::uint64_t lidar_ticket, const std::string& reason) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   ++rec.metrics.odometry_degrade_resets;
+  rec.events.push_back({"odometry_reset", stamp, lidar_ticket, reason});
 }
 
 void record_loop_candidate(double score) {
@@ -339,6 +344,12 @@ Metrics snapshot_metrics() {
   return rec.metrics;
 }
 
+std::vector<EventRecord> snapshot_events() {
+  auto& rec = recorder();
+  std::lock_guard<std::mutex> lock(rec.mutex);
+  return rec.events;
+}
+
 PipelineStatus snapshot_pipeline_status() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
@@ -405,6 +416,7 @@ struct VoxelSlamOptions {
 struct Result {
   std::vector<voxelslam_offline::PoseRecord> poses;
   voxelslam_offline::Metrics metrics;
+  std::vector<voxelslam_offline::EventRecord> events;
 };
 
 static py::array_t<double> poses_to_array(const std::vector<voxelslam_offline::PoseRecord>& poses) {
@@ -515,10 +527,26 @@ static py::dict metrics_to_dict(const voxelslam_offline::Metrics& d) {
   return out;
 }
 
+static py::list events_to_list(const std::vector<voxelslam_offline::EventRecord>& events) {
+  py::list out;
+  for (const auto& event : events) {
+    py::dict item;
+    item["type"] = event.type;
+    item["stamp"] = event.stamp;
+    item["lidar_ticket"] = event.lidar_ticket;
+    item["reason"] = event.reason;
+    out.append(item);
+  }
+  return out;
+}
+
 static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
                                std::size_t pending_imu,
                                std::size_t pending_lidar,
                                std::size_t pending_loop_scanposes,
+                               bool loop_processing,
+                               bool loop_update_pending,
+                               bool loop_reset_pending,
                                bool loop_enabled,
                                bool gba_enabled) {
   py::dict out;
@@ -544,6 +572,9 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
 
   py::dict loop;
   loop["pending_queue"] = pending_loop_scanposes;
+  loop["processing"] = loop_processing;
+  loop["update_pending"] = loop_update_pending;
+  loop["reset_pending"] = loop_reset_pending;
   out["loop"] = loop;
 
   py::dict workers;
@@ -580,11 +611,14 @@ class VoxelSlam {
   }
 
   ~VoxelSlam() {
-    try {
-      if (!finished_) {
+    if (!finished_) {
+      try {
         finish(1.0);
+      } catch (const std::exception& exc) {
+        std::fprintf(stderr, "VoxelSlam cleanup failed: %s\n", exc.what());
+      } catch (...) {
+        std::fprintf(stderr, "VoxelSlam cleanup failed with an unknown exception\n");
       }
-    } catch (...) {
     }
   }
 
@@ -694,15 +728,8 @@ class VoxelSlam {
     }
 
     if (cloud->empty()) {
-      PointType point;
-      point.x = 0.0f;
-      point.y = 0.0f;
-      point.z = 0.0f;
-      point.intensity = 0.0f;
-      point.curvature = 0.0f;
-      cloud->push_back(point);
-      point.curvature = 0.09f;
-      cloud->push_back(point);
+      std::fprintf(stderr, "dropping empty lidar sweep at %.9f after filtering\n", stamp);
+      return 0;
     }
 
     std::sort(cloud->begin(), cloud->end(), [](const PointType& a, const PointType& b) {
@@ -726,7 +753,12 @@ class VoxelSlam {
       return result_;
     }
 
-    wait_for_processed(latest_lidar_ticket_, timeout_seconds);
+    std::exception_ptr finish_error;
+    try {
+      wait_for_processed(latest_lidar_ticket_, timeout_seconds);
+    } catch (...) {
+      finish_error = std::current_exception();
+    }
     request_finish();
     if (has_thread_error()) {
       node_.setParam("__shutdown", true);
@@ -746,7 +778,11 @@ class VoxelSlam {
 
     result_.poses = voxelslam_offline::take_poses();
     result_.metrics = voxelslam_offline::snapshot_metrics();
+    result_.events = voxelslam_offline::snapshot_events();
     finished_ = true;
+    if (finish_error) {
+      std::rethrow_exception(finish_error);
+    }
     throw_if_thread_error();
     return result_;
   }
@@ -805,11 +841,12 @@ class VoxelSlam {
     const auto start = std::chrono::steady_clock::now();
     while (true) {
       throw_if_thread_error();
-      if (voxelslam_offline::snapshot_pipeline_status().latest_lidar_processed_ticket >= target) {
+      const auto status = voxelslam_offline::snapshot_pipeline_status();
+      if (status.latest_lidar_processed_ticket >= target && loop_closure_idle()) {
         return;
       }
       if (has_timeout && std::chrono::steady_clock::now() - start > timeout) {
-        throw std::runtime_error("timed out waiting for VoxelSLAM lidar processing");
+        throw std::runtime_error("timed out waiting for VoxelSLAM lidar processing and loop closure idle");
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -879,6 +916,17 @@ class VoxelSlam {
     }
   }
 
+  bool loop_closure_idle() const {
+    if (!options_.enable_loop_closure || !slam_) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(slam_->mtx_loop);
+    return slam_->buf_lba2loop.empty() &&
+           slam_->loop_processing == 0 &&
+           slam_->loop_detect == 0 &&
+           slam_->reset_flag == 0;
+  }
+
   std::vector<voxelslam_offline::PoseRecord> current_poses() const {
     if (finished_) {
       return result_.poses;
@@ -896,15 +944,24 @@ class VoxelSlam {
     }
 
     std::size_t pending_loop_scanposes = 0;
+    bool loop_processing = false;
+    bool loop_update_pending = false;
+    bool loop_reset_pending = false;
     if (slam_) {
       std::lock_guard<std::mutex> lock(slam_->mtx_loop);
       pending_loop_scanposes = slam_->buf_lba2loop.size();
+      loop_processing = slam_->loop_processing != 0;
+      loop_update_pending = slam_->loop_detect != 0;
+      loop_reset_pending = slam_->reset_flag != 0;
     }
 
     return status_to_dict(voxelslam_offline::snapshot_pipeline_status(),
                           pending_imu,
                           pending_lidar,
                           pending_loop_scanposes,
+                          loop_processing,
+                          loop_update_pending,
+                          loop_reset_pending,
                           options_.enable_loop_closure,
                           options_.enable_global_mapping);
   }
@@ -1070,6 +1127,9 @@ PYBIND11_MODULE(_core, m) {
       })
       .def_property_readonly("metrics", [](const Result& result) {
         return metrics_to_dict(result.metrics);
+      })
+      .def_property_readonly("events", [](const Result& result) {
+        return events_to_list(result.events);
       });
 
   py::class_<VoxelSlam>(m, "VoxelSlam")

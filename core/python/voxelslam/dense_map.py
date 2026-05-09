@@ -66,14 +66,22 @@ class DenseMapBuffer:
         trajectory: np.ndarray,
         lidar_to_imu: np.ndarray,
     ) -> None:
+        with BinaryPlyWriter(path) as writer:
+            for points in self.iter_world_points(trajectory, lidar_to_imu):
+                writer.write(points)
+
+    def iter_world_points(
+        self,
+        trajectory: np.ndarray,
+        lidar_to_imu: np.ndarray,
+    ):
         trajectory = _prepare_trajectory(trajectory)
         lidar_to_imu = np.asarray(lidar_to_imu, dtype=np.float64)
         if lidar_to_imu.shape != (4, 4):
             raise RuntimeError("lidar_to_imu must be a 4x4 transform")
 
-        with BinaryPlyWriter(path) as writer:
-            for scan in self._points.iter_points():
-                writer.write(_transform_scan(scan, trajectory, lidar_to_imu))
+        for scan in self._points.iter_points():
+            yield _transform_scan(scan, trajectory, lidar_to_imu)
 
     def close(self) -> None:
         self._points.close()

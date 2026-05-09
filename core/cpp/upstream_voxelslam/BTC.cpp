@@ -157,6 +157,15 @@ void STDescManager::GenerateSTDescs(
     pcl::PointCloud<pcl::PointXYZI>::Ptr &input_cloud,
     std::vector<STD> &stds_vec, int id) 
 { // step1, voxelization and plane dection
+  stds_vec.clear();
+  if (!input_cloud || input_cloud->empty()) {
+    pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
+        new pcl::PointCloud<pcl::PointXYZINormal>);
+    plane_cloud->header.seq = id;
+    plane_cloud_vec_.push_back(plane_cloud);
+    return;
+  }
+
   std::unordered_map<BTCVOXEL_LOC, BTCOctoTree *> voxel_map;
   init_voxel_map(input_cloud, voxel_map);
   pcl::PointCloud<pcl::PointXYZINormal>::Ptr plane_cloud(
@@ -191,7 +200,6 @@ void STDescManager::GenerateSTDescs(
   // vec_binary = binary_list;
 
   // step4, generate stable triangle descriptors
-  stds_vec.clear();
   generate_std(binary_list, current_frame_id_, stds_vec);
   // std::cout << "[Description] stds size:" << stds_vec.size() << std::endl;
 
@@ -349,6 +357,10 @@ void STDescManager::get_project_plane(
   }
   for (size_t i = 0; i < origin_list.size(); i++)
     origin_list[i]->id_ = 0;
+  if (origin_list.empty()) {
+    return;
+  }
+
   int current_id = 1;
   for (auto iter = origin_list.end() - 1; iter != origin_list.begin(); iter--) 
   {
@@ -989,10 +1001,14 @@ void STDescManager::generate_std(
     pi.z = var.location_[2];
     key_cloud.push_back(pi);
   }
+  int K = config_setting_.descriptor_near_num_;
+  if (key_cloud.empty() || K < 3) {
+    return;
+  }
+
   pcl::KdTreeFLANN<pcl::PointXYZ>::Ptr kd_tree(
       new pcl::KdTreeFLANN<pcl::PointXYZ>);
   kd_tree->setInputCloud(key_cloud.makeShared());
-  int K = config_setting_.descriptor_near_num_;
   std::vector<int> pointIdxNKNSearch(K);
   std::vector<float> pointNKNSquaredDistance(K);
   for (size_t i = 0; i < key_cloud.size(); i++) 
@@ -1435,6 +1451,9 @@ double STDescManager::plane_geometric_verify(
     pi.y = target_cloud->points[i].y;
     pi.z = target_cloud->points[i].z;
     input_cloud->push_back(pi);
+  }
+  if (source_cloud->empty() || input_cloud->empty()) {
+    return 0.0;
   }
 
   kd_tree->setInputCloud(input_cloud);
