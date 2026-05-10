@@ -1528,6 +1528,7 @@ public:
             {
               octos.push_back(iter->second);
               iter->second->tras_ptr(octos);
+              surf_map_slide.erase(iter->first);
               surf_map.erase(iter++);
             }
           }
