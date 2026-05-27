@@ -467,16 +467,8 @@ public:
   {
     Eigen::Vector3d g0 = xs[0].g;
     Eigen::Vector3d n0 = g0 / g0.norm();
-    Eigen::Vector3d n1(0, 0, 1);
-    if(n0[2] < 0)
-      n1[2] = -1;
-    
-    Eigen::Vector3d rotvec = n0.cross(n1);
-    double rnorm = rotvec.norm();
-    rotvec = rotvec / rnorm;
+    Eigen::Matrix3d rot = Eigen::Quaterniond::FromTwoVectors(n0, Eigen::Vector3d(0, 0, 1)).toRotationMatrix();
 
-    Eigen::AngleAxisd angaxis(asin(rnorm), rotvec);
-    Eigen::Matrix3d rot = angaxis.matrix();
     g0 = rot * g0;
 
     Eigen::Vector3d p0 = xs[0].p;
