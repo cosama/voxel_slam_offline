@@ -193,6 +193,21 @@ public:
     last_imu = imus.back();
   }
 
+  // Seed gravity from the *direction* of the mean specific force only, rescaled
+  // to the known gravity magnitude. Using the raw magnitude seeds gravity low
+  // whenever initialization happens under motion (the mean specific force is
+  // then not gravity), which biases every subsequent propagation step. The
+  // normalization also makes the seed independent of the raw acceleration
+  // units, so `scale_gravity` is deliberately not applied here; it is left
+  // untouched for the propagation path that needs it.
+  Eigen::Vector3d normalized_gravity_seed() const
+  {
+    const double mean_acc_norm = mean_acc.norm();
+    if(mean_acc_norm > 1e-9)
+      return -mean_acc / mean_acc_norm * G_m_s2;
+    return Eigen::Vector3d(0, 0, -G_m_s2);
+  }
+
   int process(IMUST &x_curr, pcl::PointCloud<PointType> &pcl_in, deque<sensor_msgs::Imu::Ptr> &imus)
   {
     if(!init_flag)
@@ -201,7 +216,7 @@ public:
       if(mean_acc.norm() < 2 && imu_topic == "/livox/imu")
         scale_gravity = G_m_s2;
       printf("scale_gravity: %lf %lf %d\n", scale_gravity, mean_acc.norm(), init_num);
-      x_curr.g = -mean_acc * scale_gravity;
+      x_curr.g = normalized_gravity_seed();
       if(init_num > min_init_num) init_flag = true;
       last_pcl_end_time = pcl_end_time;
 

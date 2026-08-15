@@ -881,7 +881,10 @@ public:
       {
         pointVar &pv = pptr->at(i);
         Eigen::Matrix3d phat = hat(pv.pnt);
-        Eigen::Matrix3d var_world = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
+        // The rotational term is body-frame (right perturbation, see the
+        // measurement Jacobian below) and must be rotated into the world frame.
+        Eigen::Matrix3d var_world = x_curr.R * pv.var * x_curr.R.transpose() +
+          x_curr.R * phat * rot_var * phat.transpose() * x_curr.R.transpose() + tsl_var;
         Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
 
         double sigma_d = 0;
@@ -1306,7 +1309,7 @@ public:
     odom_ekf.mean_acc.setZero();
     odom_ekf.init_num = 0;
     odom_ekf.IMU_init(imus);
-    x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
+    x_curr.g = odom_ekf.normalized_gravity_seed();
 
     for(int i=0; i<imu_pre_buf.size(); i++)
       delete imu_pre_buf[i];

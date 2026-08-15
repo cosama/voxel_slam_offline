@@ -699,14 +699,6 @@ class VoxelSlam {
       }
     }
 
-    float max_time = 0.0f;
-    for (float t : relative_times) {
-      if (std::isfinite(t)) {
-        max_time = std::max(max_time, t);
-      }
-    }
-    const double begin_stamp = stamp_is_end ? stamp - static_cast<double>(max_time) : stamp;
-
     pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
     cloud->reserve(static_cast<std::size_t>(count));
     for (py::ssize_t i = 0; i < count; ++i) {
@@ -735,9 +727,16 @@ class VoxelSlam {
     std::sort(cloud->begin(), cloud->end(), [](const PointType& a, const PointType& b) {
       return a.curvature < b.curvature;
     });
-    while (!cloud->empty() && cloud->back().curvature > 0.11f) {
-      cloud->points.pop_back();
+    if (scan_duration > 0.0) {
+      while (!cloud->empty() && cloud->back().curvature > scan_duration * 1.1) {
+        cloud->points.pop_back();
+      }
     }
+    if (cloud->empty()) {
+      std::fprintf(stderr, "dropping lidar sweep at %.9f: no points within scan_duration\n", stamp);
+      return 0;
+    }
+    const double begin_stamp = stamp_is_end ? stamp - cloud->back().curvature : stamp;
 
     const std::uint64_t ticket = ++latest_lidar_ticket_;
     voxelslam_offline::record_lidar_pushed(ticket);

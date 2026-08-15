@@ -99,8 +99,6 @@ void pcl_handler(T &msg)
   {
     return x.curvature < y.curvature;
   });
-  while(pl_ptr->back().curvature > 0.11)
-    pl_ptr->points.pop_back();
 
   mBuf.lock();
   time_buf.push_back(t0);
@@ -230,7 +228,11 @@ void pvec_update(PVecPtr pptr, IMUST &x_curr, PLV(3) &pwld)
   for(pointVar &pv: *pptr)
   {
     Eigen::Matrix3d phat = hat(pv.pnt);
-    pv.var = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
+    // `cov.block<3,3>(0,0)` is a body-frame rotation covariance (the state uses
+    // the right perturbation R = R*Exp(dtheta)), so its contribution must be
+    // rotated into the world frame before being added to world-frame terms.
+    pv.var = x_curr.R * pv.var * x_curr.R.transpose() +
+      x_curr.R * phat * rot_var * phat.transpose() * x_curr.R.transpose() + tsl_var;
     pwld.push_back(x_curr.R * pv.pnt + x_curr.p);
   }
 }
