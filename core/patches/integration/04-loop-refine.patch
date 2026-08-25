@@ -1,0 +1,44 @@
+loop_refine.hpp -- offline loop-ICP integration.
+
+1. Reject empty ICP inputs before KD-tree construction/search.
+2. Record the exact eigenvalue and convergence verdict returned to upstream.
+
+Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
+delta is generated with `diff -U3` and applied with zero fuzz.
+
+--- src/loop_refine.hpp
++++ src/loop_refine.hpp
+@@ -4,6 +4,8 @@
+ #include "tools.hpp"
+ #include "voxel_map.hpp"
+ 
++#include <voxelslam/offline_bridge.hpp>  // voxelslam_bridge: loop-result capture
++
+ // #include "STDesc.h"
+ #include <gtsam/geometry/Pose3.h>
+ #include <gtsam/slam/PriorFactor.h>
+@@ -54,6 +56,10 @@
+     pi.x = ap.x; pi.y = ap.y; pi.z = ap.z;
+     input_cloud.push_back(pi);
+   }
++  // voxelslam_bridge: ICP cannot build/search a KD-tree with an empty cloud.
++  if (pl_src.empty() || input_cloud.empty()) {
++    return false;
++  }
+   kd_tree.setInputCloud(input_cloud.makeShared());
+ 
+   vector<int> pointIdxNKNSearch(1);
+@@ -138,8 +144,11 @@
+ 
+   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(mat_norm);
+   Eigen::Vector3d eig_vec = saes.eigenvalues();
++  // voxelslam_bridge: capture the exact convergence/eigenvalue verdict returned to upstream.
++  bool passed = eig_vec[0] > icp_eigval && is_converge == 1;
++  voxelslam_offline::record_loop_icp_result(eig_vec[0], eig_vec[1], eig_vec[2], is_converge, passed, match_num);
+   printf("eigvalue: %lf %lf %lf %d\n", eig_vec[0], eig_vec[1], eig_vec[2], is_converge);
+-  return eig_vec[0] > icp_eigval && is_converge == 1;
++  return passed;
+   // return eig_vec[0] > icp_eigval;
+ 
+ }
+

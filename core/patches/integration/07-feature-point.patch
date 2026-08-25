@@ -1,0 +1,22 @@
+feature_point.hpp -- host-safe feature preprocessing failure.
+
+1. Raise a catchable configuration error for an unsupported LiDAR type instead
+   of terminating the embedding process.
+
+Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
+delta is generated with `diff -U3` and applied with zero fuzz.
+
+--- src/feature_point.hpp
++++ src/feature_point.hpp
+@@ -132,8 +132,8 @@
+       break;
+ 
+     default:
+-      printf("Lidar Type Error\n");
+-      exit(0);
++      // voxelslam_bridge: invalid configuration must be catchable by the Python host.
++      throw std::runtime_error("Lidar Type Error");
+     }
+ 
+     return t0;
+

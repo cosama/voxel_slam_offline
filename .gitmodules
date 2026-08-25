@@ -1,0 +1,3 @@
+[submodule "upstream/Voxel-SLAM"]
+	path = upstream/Voxel-SLAM
+	url = git@github.com:hku-mars/Voxel-SLAM.git

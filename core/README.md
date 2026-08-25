@@ -45,6 +45,7 @@ result = slam.finish()
 
 ## Notes
 
-The upstream reference is vendored separately under
-`core/third_party/Voxel-SLAM/`. The active C++ bridge keeps upstream file changes
-small and exposes only the ROS-free API described above.
+The algorithm source is pinned as the `upstream/Voxel-SLAM` submodule. CMake
+copies it to `build/upstream_staged` and applies the checked-in patch series
+from `patches/integration/`; the submodule itself remains pristine. See
+`UPSTREAM.md` for the pin, patch inventory, and upgrade procedure.

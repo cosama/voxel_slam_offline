@@ -1,0 +1,151 @@
+voxelslam.hpp -- shared node declarations and inline preprocessing.
+
+1. Add offline host hooks and carry LiDAR tickets through upstream queues.
+2. Retain validated long-duration points instead of silently truncating them.
+3. Make LiDAR dequeue and IMU-readiness observation race-free, expose waiting
+   state, and acknowledge sweeps that upstream consumes without estimator work.
+4. Replace process termination on missing IMU/map input with catchable errors.
+5. Rotate body-frame attitude covariance into the world frame consistently.
+
+Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
+delta is generated with `diff -U3` and applied with zero fuzz.
+
+--- src/voxelslam.hpp
++++ src/voxelslam.hpp
+@@ -5,6 +5,9 @@
+ #include "voxel_map.hpp"
+ #include "feature_point.hpp"
+ #include "loop_refine.hpp"
++#include <voxelslam/offline_bridge.hpp>  // voxelslam_bridge: offline host hooks
++#include <atomic>
++#include <cstdint>
+ #include <mutex>
+ #include <Eigen/Eigenvalues>
+ #include <tf/transform_broadcaster.h>
+@@ -44,10 +47,14 @@
+ deque<sensor_msgs::Imu::Ptr> imu_buf;
+ deque<pcl::PointCloud<PointType>::Ptr> pcl_buf;
+ deque<double> time_buf;
++// voxelslam_bridge: tickets follow LiDAR sweeps through upstream's existing queues.
++deque<std::uint64_t> lidar_ticket_buf;
+ 
+ double imu_last_time = -1;
+ int point_notime = 0;
+ double last_pcl_time = -1;
++bool pl_ready = false;
++std::uint64_t current_lidar_ticket = 0;
+ 
+ void imu_handler(const sensor_msgs::Imu::ConstPtr &msg_in)
+ {
+@@ -93,8 +100,7 @@
+   {
+     return x.curvature < y.curvature;
+   });
+-  while(pl_ptr->back().curvature > 0.11)
+-    pl_ptr->points.pop_back();
++  // voxelslam_bridge: keep long-duration points; the offline producer validates sweep timing.
+ 
+   mBuf.lock();
+   time_buf.push_back(t0);
+@@ -104,16 +110,20 @@
+ 
+ bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu)
+ {
+-  static bool pl_ready = false;
+-
+   if(!pl_ready)
+   {
+-    if(pcl_buf.empty()) return false;
+-
++    // voxelslam_bridge: test/dequeue atomically and carry the matching host ticket.
+     mBuf.lock();
++    if(pcl_buf.empty())
++    {
++      mBuf.unlock();
++      return false;
++    }
+     pl_ptr = pcl_buf.front();
+     p_imu.pcl_beg_time = time_buf.front();
++    current_lidar_ticket = lidar_ticket_buf.empty() ? 0 : lidar_ticket_buf.front();
+     pcl_buf.pop_front(); time_buf.pop_front();
++    if(!lidar_ticket_buf.empty()) lidar_ticket_buf.pop_front();
+     mBuf.unlock();
+ 
+     p_imu.pcl_end_time = p_imu.pcl_beg_time + pl_ptr->back().curvature;
+@@ -123,6 +133,8 @@
+       if(last_pcl_time < 0)
+       {
+         last_pcl_time = p_imu.pcl_beg_time;
++        // voxelslam_bridge: the first timestamp primes overlap detection but is not processed.
++        voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
+         return false;
+       }
+ 
+@@ -134,9 +146,19 @@
+     pl_ready = true;
+   }
+ 
+-  if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
++  // voxelslam_bridge: sample IMU readiness under its producer lock and expose wait state.
++  mBuf.lock();
++  double last_imu_time = imu_last_time;
++  mBuf.unlock();
++  voxelslam_offline::record_odometry_waiting_for_imu(current_lidar_ticket, pl_ready && last_imu_time <= p_imu.pcl_end_time);
++  if(!pl_ready || last_imu_time <= p_imu.pcl_end_time) return false;
+ 
+   mBuf.lock();
++  if(imu_buf.empty())
++  {
++    mBuf.unlock();
++    return false;
++  }
+   double imu_time = imu_buf.front()->header.stamp.toSec();
+   while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
+   {
+@@ -149,7 +171,8 @@
+ 
+   if(imu_buf.empty())
+   {
+-    printf("imu buf empty\n"); exit(0);
++    // voxelslam_bridge: never terminate the embedding process from library code.
++    throw std::runtime_error("imu buf empty");
+   }
+ 
+   pl_ready = false;
+@@ -157,7 +180,11 @@
+   if(imus.size() > 4)
+     return true;
+   else
++  {
++    // voxelslam_bridge: undersampled IMU batches consume the sweep without estimator work.
++    voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
+     return false;
++  }
+ }
+ 
+ double dept_err, beam_err;
+@@ -208,7 +235,11 @@
+   for(pointVar &pv: *pptr)
+   {
+     Eigen::Matrix3d phat = hat(pv.pnt);
+-    pv.var = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
++    // voxelslam_bridge: `cov.block<3,3>(0,0)` is a body-frame rotation covariance (the state uses
++    // the right perturbation R = R*Exp(dtheta)), so its contribution must be
++    // rotated into the world frame before being added to world-frame terms.
++    pv.var = x_curr.R * pv.var * x_curr.R.transpose() +
++      x_curr.R * phat * rot_var * phat.transpose() * x_curr.R.transpose() + tsl_var;
+     pwld.push_back(x_curr.R * pv.pnt + x_curr.p);
+   }
+ }
+@@ -219,8 +250,8 @@
+   ifstream file(filename);
+   if(!file.is_open())
+   {
+-    printf("Error: %s not found\n", filename.c_str());
+-    exit(0);
++    // voxelslam_bridge: propagate missing map input to Python instead of exiting the host.
++    throw std::runtime_error("Error: " + filename + " not found");
+   }
+ 
+   string lineStr, str;
+

@@ -593,7 +593,9 @@ class VoxelSlam {
  public:
   explicit VoxelSlam(const VoxelSlamOptions& options) : options_(options) {
     validate_options(options_);
-    std::filesystem::create_directories(options_.save_path);
+    if (options_.is_save_map) {
+      std::filesystem::create_directories(options_.save_path);
+    }
     reset_upstream_buffers();
     voxelslam_offline::reset_records(options_.emit_deskewed_points);
     configure_node(options_);

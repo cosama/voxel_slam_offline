@@ -1,0 +1,95 @@
+voxel_map.hpp -- voxel-map optimization and bookkeeping fixes.
+
+1. Handle voxel counts smaller than the configured residual worker count.
+2. Guard LM gain and convergence ratios against zero denominators.
+3. Propagate an invalid optimizer-state index as an exception.
+4. Fix wrong-container end-iterator comparisons in both voxel-cutting paths.
+
+Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
+delta is generated with `diff -U3` and applied with zero fuzz.
+
+--- src/voxel_map.hpp
++++ src/voxel_map.hpp
+@@ -340,18 +340,17 @@
+     // voxhess.evaluate_only_residual(x_stats, 0, voxhess.plvec_voxels.size(), residual1);
+ 
+     // int thd_num = 2;
+-    vector<double> residuals(thd_num, 0);
++    // voxelslam_bridge: sparse workloads fall back to one valid residual partition.
++    int tthd_num = thd_num;
+     int g_size = voxhess.plvec_voxels.size();
+-    if(g_size < thd_num)
+-    {
+-      printf("Too Less Voxel"); exit(0);
+-    }
+-    vector<thread*> mthreads(thd_num, nullptr);
+-    double part = 1.0 * g_size / thd_num;
+-    for(int i=1; i<thd_num; i++)
++    if(g_size < tthd_num) tthd_num = 1;
++    vector<double> residuals(tthd_num, 0);
++    vector<thread*> mthreads(tthd_num, nullptr);
++    double part = 1.0 * g_size / tthd_num;
++    for(int i=1; i<tthd_num; i++)
+       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
+ 
+-    for(int i=0; i<thd_num; i++)
++    for(int i=0; i<tthd_num; i++)
+     {
+       if(i != 0) 
+         mthreads[i]->join();
+@@ -412,10 +411,11 @@
+       residual2 = only_residual(x_stats_temp, voxhess);
+ 
+       q = (residual1-residual2);
++      // voxelslam_bridge: an undefined LM gain ratio must not drive damping updates.
+       if(is_display)
+-        printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, q/q1, q1, q);
++        printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, fabs(q1) > 1e-12 ? q / q1 : 0.0, q1, q);
+ 
+-      if(q > 0)
++      if(q > 0 && fabs(q1) > 1e-12)
+       {
+         x_stats = x_stats_temp;
+         double one_three = 1.0 / 3;
+@@ -434,7 +434,8 @@
+         is_converge = false;
+       }
+ 
+-      if(fabs((residual1-residual2)/residual1)<1e-6)
++      // voxelslam_bridge: relative convergence is undefined for a zero baseline residual.
++      if(fabs(residual1) > 1e-12 && fabs((residual1-residual2)/residual1)<1e-6)
+         break;
+     }
+     resis.push_back(residual2);
+@@ -1210,8 +1211,8 @@
+ 
+       if(opt_state >= int(vox_opt.pcr_adds.size()))
+       {
+-        printf("Error: opt_state: %d %zu\n", opt_state, vox_opt.pcr_adds.size());
+-        exit(0);
++        // voxelslam_bridge: report corrupt optimizer state without terminating Python.
++        throw std::runtime_error("opt_state out of range");
+       }
+ 
+       if(opt_state >= 0)
+@@ -1521,7 +1522,8 @@
+     {
+       iter->second->allocate(win_count, pv, pw, sws);
+       iter->second->isexist = true;
+-      if(feat_tem_map.find(position) == feat_map.end())
++      // voxelslam_bridge: compare a temporary-map iterator with its own sentinel.
++      if(feat_tem_map.find(position) == feat_tem_map.end())
+         feat_tem_map[position] = iter->second;
+     }
+     else
+@@ -1562,7 +1564,8 @@
+     if(iter != feat_map.end())
+     {
+       iter->second->isexist = true;
+-      if(feat_tem_map.find(position) == feat_map.end())
++      // voxelslam_bridge: apply the same temporary-map sentinel fix in multi-window cutting.
++      if(feat_tem_map.find(position) == feat_tem_map.end())
+         feat_tem_map[position] = iter->second;
+       ot = iter->second;
+     }
+
