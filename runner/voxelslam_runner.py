@@ -135,6 +135,7 @@ def run_bag(
                         dense_map,
                         last_imu_stamp=last_imu_stamp,
                         stamp_is_end=runner_config.stamp_is_end,
+                        scan_duration=runner_config.scan_duration,
                     )
                 else:
                     stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
@@ -150,6 +151,7 @@ def run_bag(
                         dense_map,
                         last_imu_stamp=last_imu_stamp,
                         stamp_is_end=runner_config.stamp_is_end,
+                        scan_duration=runner_config.scan_duration,
                     )
                     report_progress(dense_map, imu_count, lidar_count, start_time)
 
@@ -159,6 +161,7 @@ def run_bag(
             dense_map,
             last_imu_stamp=last_imu_stamp,
             stamp_is_end=runner_config.stamp_is_end,
+            scan_duration=runner_config.scan_duration,
             require_all=True,
         )
         result = slam.finish()
@@ -211,6 +214,7 @@ def push_ready_lidar(
     *,
     last_imu_stamp: float | None,
     stamp_is_end: bool,
+    scan_duration: float,
     require_all: bool = False,
 ) -> int:
     pushed = 0
@@ -219,7 +223,7 @@ def push_ready_lidar(
         if points.size == 0:
             pending_lidar.pop(0)
             continue
-        scan_end = stamp if stamp_is_end else stamp + float(np.max(times))
+        scan_end = stamp if stamp_is_end else stamp + scan_duration * 1.1
         if (
             last_imu_stamp is None
             or last_imu_stamp
@@ -242,6 +246,7 @@ def push_ready_lidar(
             points,
             times,
             intensities,
+            scan_duration=scan_duration,
             stamp_is_end=stamp_is_end,
         )
         slam.wait_for_processed(

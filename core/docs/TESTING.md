@@ -10,6 +10,7 @@ python3 -m pip install --user --break-system-packages -e ./core
 
 Native build dependencies used during this test:
 
+- `patch`
 - `libeigen3-dev`
 - `libpcl-dev`
 - `libgtsam-dev`
@@ -18,6 +19,15 @@ Native build dependencies used during this test:
 `libgtsam-dev` on Ubuntu 24.04 has a broken CMake export referencing a missing
 `libCppUnitLite.a`, so this package links `libgtsam` directly instead of using
 `find_package(GTSAM)`.
+
+Initialize the pinned algorithm source before building:
+
+```bash
+git submodule update --init --recursive
+```
+
+CMake copies that source into its build tree and applies
+`patches/integration/*.patch` with zero fuzz; it never edits the submodule.
 
 ## Smoke Tests
 

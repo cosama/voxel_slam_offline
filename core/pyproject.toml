@@ -16,3 +16,15 @@ classifiers = [
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = ["python/voxelslam"]
+
+# Invalidate uv's local native wheel whenever the bridge, staged patch series,
+# build definition, or pinned submodule revision changes.
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "CMakeLists.txt" },
+  { file = "python/**/*.py" },
+  { file = "cpp/**" },
+  { file = "patches/**/*.patch" },
+  { git = { commit = true } },
+]

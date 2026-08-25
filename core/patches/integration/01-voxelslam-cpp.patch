@@ -1,0 +1,422 @@
+voxelslam.cpp -- the Voxel-SLAM node implementation.
+
+One patch per upstream file, so this patch carries every bridge change to
+voxelslam.cpp. Every hunk explains its rationale in the staged source with a
+`voxelslam_bridge:` tag; this numbered header is the concern-level index.
+
+1. Capture upstream odometry, deskewed scans, loop decisions, GBA metrics, and
+   the finalized optimized path for the offline result API.
+2. Make gravity alignment, covariance rotation, and convergence calculations
+   well-defined for aligned vectors and zero/short residual inputs.
+3. Make cross-thread loop/reset flags atomic and expose stable worker/ticket
+   lifecycle state, including initialization, degradation, and reset outcomes.
+4. Suppress ROS subscriptions in the Python module and gate both map-output
+   directory creation sites on the existing `is_save_map` option.
+5. Remove stale slide-map pointers when their owning octrees are released.
+6. Preserve loop-closure acceptance behavior while recording each gate and
+   ensure the loop busy flag clears on every iteration exit.
+7. Refuse undersized GBA windows before code that assumes two states.
+
+Hunks are generated with `diff -U3` and applied with `patch -F0 -p0`; missing
+context is therefore rejected as upstream drift rather than accepted with fuzz.
+
+--- src/voxelslam.cpp
++++ src/voxelslam.cpp
+@@ -1,5 +1,7 @@
+ #include "voxelslam.hpp"
+ 
++#include <voxelslam/offline_bridge.hpp>  // voxelslam_bridge: offline host hooks
++
+ using namespace std;
+ 
+ class ResultOutput
+@@ -31,6 +33,10 @@
+ 
+   void pub_localtraj(PLV(3) &pwld, double jour, IMUST &x_curr, int cur_session, pcl::PointCloud<PointType> &pcl_path)
+   {
++    // voxelslam_bridge: capture every upstream odometry publication for Python.
++    Eigen::Quaterniond q_curr(x_curr.R);
++    voxelslam_offline::record_pose(x_curr.t, x_curr.p, q_curr);
++
+     pub_odom_func(x_curr);
+     pcl::PointCloud<PointType> pcl_send;
+     pcl_send.reserve(pwld.size());
+@@ -462,16 +468,9 @@
+   {
+     Eigen::Vector3d g0 = xs[0].g;
+     Eigen::Vector3d n0 = g0 / g0.norm();
+-    Eigen::Vector3d n1(0, 0, 1);
+-    if(n0[2] < 0)
+-      n1[2] = -1;
+-    
+-    Eigen::Vector3d rotvec = n0.cross(n1);
+-    double rnorm = rotvec.norm();
+-    rotvec = rotvec / rnorm;
++    // voxelslam_bridge: FromTwoVectors handles aligned/antiparallel gravity without dividing by zero.
++    Eigen::Matrix3d rot = Eigen::Quaterniond::FromTwoVectors(n0, Eigen::Vector3d(0, 0, 1)).toRotationMatrix();
+ 
+-    Eigen::AngleAxisd angaxis(asin(rnorm), rotvec);
+-    Eigen::Matrix3d rot = angaxis.matrix();
+     g0 = rot * g0;
+ 
+     Eigen::Vector3d p0 = xs[0].p;
+@@ -734,15 +733,17 @@
+   mutex mtx_loop;
+   deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
+   vector<Keyframe*> *keyframes;
+-  int loop_detect = 0;
++  // voxelslam_bridge: worker flags cross threads and must not participate in data races.
++  std::atomic<int> loop_detect{0};
++  std::atomic<int> loop_processing{0};
+   unordered_map<VOXEL_LOC, OctoTree*> map_loop;
+   IMUST dx;
+   pcl::PointCloud<PointType>::Ptr pl_kdmap;
+   pcl::KdTreeFLANN<PointType> kd_keyframes;
+   int history_kfsize = 0;
+   vector<OctoTree*> octos_release;
+-  int reset_flag = 0;
+-  int g_update = 0;
++  std::atomic<int> reset_flag{0};
++  std::atomic<int> g_update{0};
+   int thread_num = 5;
+   int degrade_bound = 10;
+ 
+@@ -778,11 +779,14 @@
+     n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
+     n.param<int>("General/is_save_map", is_save_map, 0);
+ 
++    // voxelslam_bridge: Python injects decoded messages directly; ROS subscribers are unavailable.
++#ifndef VOXELSLAM_PYTHON_MODULE
+     sub_imu = n.subscribe(imu_topic, 80000, imu_handler);
+     if(feat.lidar_type == LIVOX)
+       sub_pcl = n.subscribe<livox_ros_driver::CustomMsg>(lid_topic, 1000, pcl_handler);
+     else
+       sub_pcl = n.subscribe<sensor_msgs::PointCloud2>(lid_topic, 1000, pcl_handler);
++#endif
+     odom_ekf.imu_topic = imu_topic;
+ 
+     n.param<double>("Odometry/cov_gyr", cov_gyr, 0.1);
+@@ -832,20 +836,22 @@
+     rand_walk_gyr, rand_walk_gyr, rand_walk_gyr, 
+     rand_walk_acc, rand_walk_acc, rand_walk_acc;
+ 
++    // voxelslam_bridge: map-disabled sessions must not touch the filesystem.
+     int ss = 0;
+-    if(access((savepath+bagname+"/").c_str(), X_OK) == -1)
++    if(is_save_map == 1)
+     {
+-      string cmd = "mkdir " + savepath + bagname + "/";
+-      ss = system(cmd.c_str());
+-    }
+-    else
+-      ss = -1;
++      if(access((savepath+bagname+"/").c_str(), X_OK) == -1)
++      {
++        string cmd = "mkdir " + savepath + bagname + "/";
++        ss = system(cmd.c_str());
++      }
++      else
++        ss = -1;
+ 
+-    if(ss != 0 && is_save_map == 1)
+-    {
+-      printf("The pointcloud will be saved in this run.\n");
+-      printf("So please clear or rename the existed folder.\n"); 
+-      exit(0);
++      if(ss != 0)
++      {
++        throw std::runtime_error("map save directory already exists; clear or rename it before enabling map saving");
++      }
+     }
+ 
+     sws.resize(thread_num);
+@@ -883,7 +889,10 @@
+       {
+         pointVar &pv = pptr->at(i);
+         Eigen::Matrix3d phat = hat(pv.pnt);
+-        Eigen::Matrix3d var_world = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
++        // voxelslam_bridge: the rotational term is body-frame (right perturbation, see the
++        // measurement Jacobian below) and must be rotated into the world frame.
++        Eigen::Matrix3d var_world = x_curr.R * pv.var * x_curr.R.transpose() +
++          x_curr.R * phat * rot_var * phat.transpose() * x_curr.R.transpose() + tsl_var;
+         Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
+ 
+         double sigma_d = 0;
+@@ -1240,11 +1249,18 @@
+     if(win_count == 0)
+       imupre_scale_gravity = odom_ekf.scale_gravity;
+ 
++    // voxelslam_bridge: retain the pre-downsample deskewed scan only when requested.
++    pcl::PointCloud<PointType>::Ptr dense_deskewed_scan;
++    if(voxelslam_offline::is_emitting_deskewed_points())
++      dense_deskewed_scan.reset(new pcl::PointCloud<PointType>(*pcl_curr));
++
+     PVecPtr pptr(new PVec);
+     double downkd = down_size >= 0.5 ? down_size : 0.5;
+     down_sampling_voxel(*pcl_curr, downkd);
+     var_init(extrin_para, *pcl_curr, pptr, dept_err, beam_err);
+     lio_state_estimation_kdtree(pptr);
++    if(dense_deskewed_scan)
++      voxelslam_offline::record_dense_deskewed_scan(*dense_deskewed_scan, x_curr, extrin_para);
+ 
+     pwld.clear();
+     pvec_update(pptr, x_curr, pwld);
+@@ -1302,7 +1318,8 @@
+     odom_ekf.mean_acc.setZero();
+     odom_ekf.init_num = 0;
+     odom_ekf.IMU_init(imus);
+-    x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
++    // voxelslam_bridge: reuse the scale-independent gravity initializer on reset.
++    x_curr.g = odom_ekf.normalized_gravity_seed();
+ 
+     for(int i=0; i<imu_pre_buf.size(); i++)
+       delete imu_pre_buf[i];
+@@ -1516,6 +1533,8 @@
+             {
+               octos.push_back(iter->second);
+               iter->second->tras_ptr(octos);
++              // voxelslam_bridge: erase the parallel index before freeing its octree pointer.
++              surf_map_slide.erase(iter->first);
+               surf_map.erase(iter++);
+             }
+           }
+@@ -1538,8 +1557,9 @@
+         sleep(0.001);
+         continue;
+       }
+-
+       static int first_flag = 1;
++      // voxelslam_bridge: acknowledge each input ticket exactly once after map insertion.
++      bool lidar_processed = false;
+       if (first_flag)
+       {
+         pcl::PointCloud<PointType> pl;
+@@ -1558,18 +1578,30 @@
+         if(init == 1)
+         {
+           motion_init_flag = 0;
++          // voxelslam_bridge: initialization consumes this sweep without adding a keyframe.
++          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
++          lidar_processed = true;
+         }
+         else
+         {
+           if(init == -1)
++          {
++            voxelslam_offline::record_odometry_reset(
++                odom_ekf.pcl_beg_time, current_lidar_ticket, "initialization_failed");
+             system_reset(imus);
++          }
++          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
+           continue;
+         }
+       }
+       else
+       {
++        // voxelslam_bridge: failed preprocessing still completes the host-side ticket.
+         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
++        {
++          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
+           continue;
++        }
+ 
+         pcl::PointCloud<PointType> pl_down = *pcl_curr;
+         down_sampling_voxel(pl_down, down_size);
+@@ -1590,6 +1622,9 @@
+         else
+           degrade_cnt++;
+ 
++        // voxelslam_bridge: expose the live odometry path's deskewed scan before map downsampling.
++        voxelslam_offline::record_dense_deskewed_scan(*pcl_curr, x_curr, extrin_para);
++
+         pwld.clear();
+         pvec_update(pptr, x_curr, pwld);
+         ResultOutput::instance().pub_localtraj(pwld, jour, x_curr, sessionNames.size()-1, pcl_path);
+@@ -1617,6 +1652,9 @@
+ 
+         if(degrade_cnt > degrade_bound)
+         {
++          // voxelslam_bridge: report why the trajectory segment ended before resetting state.
++          voxelslam_offline::record_odometry_reset(
++              x_curr.t, current_lidar_ticket, "degrade_bound");
+           degrade_cnt = 0;
+           system_reset(imus);
+ 
+@@ -1630,6 +1668,8 @@
+           motion_init_flag = 1;
+           history_kfsize = 0;
+ 
++          // voxelslam_bridge: the degrading sweep reached map work before triggering reset.
++          voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
+           continue;
+         }
+       }
+@@ -1711,6 +1751,9 @@
+ 
+         win_base += mgsize; win_count -= mgsize;
+       }
++      // voxelslam_bridge: normal sweeps complete only after local-map/keyframe work finishes.
++      if(!lidar_processed)
++        voxelslam_offline::record_lidar_processed(current_lidar_ticket, true);
+       
+       double t_end = ros::Time::now().toSec();
+       double mem = get_memory();
+@@ -1875,8 +1918,13 @@
+         jours.push_back(0);
+ 
+         bagname = sessionNames.back();
+-        string cmd = "mkdir " + savepath + bagname + "/";
+-        int ss = system(cmd.c_str());
++        // voxelslam_bridge: new loop-closure sessions create output directories only on opt-in.
++        if(is_save_map)
++        {
++          string cmd = "mkdir " + savepath + bagname + "/";
++          int ss = system(cmd.c_str());
++          (void)ss;
++        }
+ 
+         ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
+         ResultOutput::instance().pub_globalmap(multimap_keyframes, ids, pub_pmap);
+@@ -1901,9 +1949,20 @@
+       {
+         bl_head = buf_lba2loop.front();
+         buf_lba2loop.pop_front();
++        // voxelslam_bridge: make an in-flight loop job visible to finish()/status().
++        loop_processing = 1;
+       }
+       mtx_loop.unlock();
+       if(bl_head == nullptr) continue;
++      // voxelslam_bridge: clear the busy flag on every exit path from this iteration.
++      struct LoopProcessingGuard
++      {
++        VOXEL_SLAM *slam;
++        ~LoopProcessingGuard()
++        {
++          slam->loop_processing = 0;
++        }
++      } loop_processing_guard{this};
+ 
+       int cur_id = std_managers.size() - 1;
+       scanPoses->push_back(bl_head);
+@@ -1990,12 +2049,16 @@
+ 
+         if(search_result.first >= 0)
+         {
++          // voxelslam_bridge: retain candidate scores for offline diagnostics.
++          voxelslam_offline::record_loop_candidate(search_result.second);
+           printf("Find Loop in session%d: %d %d\n", id, buf_base, search_result.first);
+           printf("score: %lf\n", search_result.second);
+         }
+ 
+         if(search_result.first >= 0 && search_result.second > juds[id])
+         {
++          // voxelslam_bridge: distinguish descriptor-threshold passes from accepted loop edges.
++          voxelslam_offline::record_loop_score_passed();
+           if(icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval))
+           {
+             int ord_bl = std_managers[id]->plane_cloud_vec_[search_result.first]->header.seq;
+@@ -2008,9 +2071,12 @@
+             if(id == cur_id)
+             {
+               double span = smp->jour - keyframes->at(search_result.first)->jour;
++              // voxelslam_bridge: report the exact same-session drift gate used for acceptance.
++              double drift_ratio = drift_p / span;
++              voxelslam_offline::record_loop_drift_ratio(drift_ratio, drift_ratio < ratio_drift);
+               printf("drift: %lf %lf\n", drift_p, span);
+ 
+-              if(drift_p / span < ratio_drift)
++              if(drift_ratio < ratio_drift)
+               {
+                 isPush = true;
+                 step = stepsizes.size() - 2;
+@@ -2041,7 +2107,10 @@
+               }
+               else
+               {
+-                if(drift_p / jours[id] < 0.05)
++                // voxelslam_bridge: report the cross-session drift gate independently.
++                double drift_ratio = drift_p / jours[id];
++                voxelslam_offline::record_loop_drift_ratio(drift_ratio, drift_ratio < 0.05);
++                if(drift_ratio < 0.05)
+                 {
+                   jours[id] = 1e-6; // set to 0
+                   isPush = true;
+@@ -2059,6 +2128,8 @@
+             {
+               match_num++;
+               lp_edges.push(id, cur_id, ord_bl, buf_base-1, loop_transform.second, loop_transform.first, v6_init);
++              // voxelslam_bridge: count only edges actually inserted into the pose graph.
++              voxelslam_offline::record_loop_edge_added();
+               if(step > -1)
+               {
+                 int id1 = stepsizes[step] + ord_bl;
+@@ -2096,6 +2167,8 @@
+         for(int i=0; i<5; i++) isam.update();
+         gtsam::Values results = isam.calculateEstimate();
+         int resultsize = results.size();
++        // voxelslam_bridge: expose pose-graph optimization size to metrics.
++        voxelslam_offline::record_loop_graph_optimization(resultsize);
+         
+         IMUST x1 = scanPoses->at(buf_base-1)->x;
+         int idsize = ids.size();
+@@ -2166,6 +2239,8 @@
+           history_kfsize = pl_kdmap->size();
+         }
+         loop_detect = 1;
++        // voxelslam_bridge: publish completion after optimized poses/map state are installed.
++        voxelslam_offline::record_loop_update_applied();
+ 
+         vector<int> ids2 = ids; ids2.pop_back();
+         ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids2);
+@@ -2233,6 +2308,8 @@
+     cnct_map = ids;
+     gba_size = multimap_keyframes.back()->size();
+     gba_flag = 1;
++    // voxelslam_bridge: bracket global bundle adjustment for status and timing metrics.
++    voxelslam_offline::record_gba_started(gba_size);
+ 
+     pcl::PointCloud<PointType> pl0;
+     pub_pl_func(pl0, pub_pmap);
+@@ -2300,6 +2377,8 @@
+     Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
+ 
+     double t1 = ros::Time::now().toSec();
++    // voxelslam_bridge: capture final GBA duration, graph size, and edge counts.
++    voxelslam_offline::record_gba_completed(t1 - t0, resultsize, gba_edges1.edges.size(), gba_edges2.edges.size());
+     printf("GBA opt: %lfs\n", t1 - t0);
+ 
+     for(int ii=0; ii<idsize; ii++)
+@@ -2310,6 +2389,8 @@
+     }
+ 
+     ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
++    // voxelslam_bridge: replace the live path with the finalized multi-session solution.
++    voxelslam_offline::record_optimized_path(multimap_scanPoses, ids);
+     vector<int> ids2 = ids; ids2.pop_back();
+     ResultOutput::instance().pub_globalmap(multimap_keyframes, ids2, pub_pmap);
+     ids2.clear(); ids2.push_back(ids.back());
+@@ -2348,6 +2429,9 @@
+     }
+     
+     int wdsize = smps.size();
++    // voxelslam_bridge: damping_iter requires at least two states/residual samples.
++    if(wdsize < 2)
++      return;
+     Eigen::MatrixXd hess;
+     vector<double> gba_eigen_value_array_orig = gba_eigen_value_array;
+     double gba_min_eigen_value_orig = gba_min_eigen_value;
+@@ -2382,9 +2466,11 @@
+       opt_lsv.thd_num = thread_num;
+       vector<double> resis;
+       bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
++      // voxelslam_bridge: guard convergence reporting against short/zero residual vectors.
++      double residual_change = resis.size() >= 2 && fabs(resis[0]) > 1e-12 ? fabs(resis[0] - resis[1]) / fabs(resis[0]) : 0.0;
+       if(is_display)
+-        printf("%lf\n", fabs(resis[0] - resis[1]) / resis[0]);
+-      if((fabs(resis[0] - resis[1]) / resis[0] < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
++        printf("%lf\n", residual_change);
++      if((residual_change < converge_thre && is_converge) || (iterCnt == max_iter-2 && converge_flag == 0))
+       {
+         converge_thre = 0.01;
+         if(converge_flag == 0)
+

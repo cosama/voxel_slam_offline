@@ -15,7 +15,8 @@ metrics.
 - `runner/`: optional bag frontend using `rosbags`; reads bags and URDF, writes
   trajectory CSV and optional dense PLY.
 - `docker/`: container build for the library plus runner.
-- `core/third_party/Voxel-SLAM/`: upstream reference source for comparison.
+- `upstream/Voxel-SLAM/`: pinned upstream submodule; the build copies its
+  sources into the build tree and applies `core/patches/integration/` there.
 
 ## Install
 
@@ -34,6 +35,10 @@ pip install ./core ./runner
 The core package has no ROS1 or ROS2 runtime dependency. Native dependencies
 still include the libraries used by Voxel-SLAM itself, notably PCL, Eigen, and
 GTSAM.
+
+Clone with submodules (or run `git submodule update --init --recursive`) before
+building. Upstream provenance, patch policy, and the upgrade procedure are in
+`core/UPSTREAM.md`.
 
 ## Python API
 

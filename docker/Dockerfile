@@ -13,6 +13,7 @@ RUN apt-get update \
         libgtsam-dev \
         libpcl-dev \
         ninja-build \
+        patch \
         python3 \
         python3-dev \
         python3-pip \
