@@ -50,6 +50,13 @@ struct ScalarStats {
 
 struct Metrics {
   std::uint64_t odometry_degrade_resets = 0;
+  // How much of the run the odometry prior actually decided. `applied` counts
+  // sweeps it predicted; `fallback` counts the subset where the IEKF reported a
+  // degenerate update and the prior's pose stood unregistered. A high fallback
+  // share is the signature of a run the prior carried rather than one the map
+  // constrained.
+  std::uint64_t odometry_prior_applied = 0;
+  std::uint64_t odometry_prior_fallback = 0;
 
   std::uint64_t loop_candidates = 0;
   std::uint64_t loop_score_passed = 0;
@@ -356,6 +363,131 @@ PipelineStatus snapshot_pipeline_status() {
   return rec.pipeline;
 }
 
+
+// ---------------------------------------------------------------------------
+// Externally supplied odometry prior
+// ---------------------------------------------------------------------------
+
+struct PriorTrajectory {
+  std::mutex mutex;
+  std::vector<double> stamps;
+  std::vector<Eigen::Vector3d> positions;
+  std::vector<Eigen::Quaterniond> orientations;
+  std::vector<Eigen::Vector3d> velocities;
+};
+
+PriorTrajectory& prior_trajectory() {
+  static PriorTrajectory instance;
+  return instance;
+}
+
+void record_prior_applied(bool degenerate_fallback) {
+  auto& rec = recorder();
+  std::lock_guard<std::mutex> lock(rec.mutex);
+  ++rec.metrics.odometry_prior_applied;
+  if (degenerate_fallback) {
+    ++rec.metrics.odometry_prior_fallback;
+  }
+}
+
+void set_prior_trajectory(std::vector<PoseRecord> poses) {
+  auto& prior = prior_trajectory();
+  std::lock_guard<std::mutex> lock(prior.mutex);
+  prior.stamps.clear();
+  prior.positions.clear();
+  prior.orientations.clear();
+  prior.velocities.clear();
+
+  const std::size_t count = poses.size();
+  if (count == 0) {
+    return;
+  }
+  prior.stamps.reserve(count);
+  prior.positions.reserve(count);
+  prior.orientations.reserve(count);
+
+  for (const auto& pose : poses) {
+    prior.stamps.push_back(pose.stamp);
+    prior.positions.emplace_back(pose.x, pose.y, pose.z);
+    Eigen::Quaterniond q(pose.qw, pose.qx, pose.qy, pose.qz);
+    q.normalize();
+    // Keep consecutive samples on one hemisphere so slerp between neighbours
+    // never takes the long way around.
+    if (!prior.orientations.empty() &&
+        q.coeffs().dot(prior.orientations.back().coeffs()) < 0.0) {
+      q.coeffs() *= -1.0;
+    }
+    prior.orientations.push_back(q);
+  }
+
+  // Central differences, one-sided at both ends. The prior carries pose only,
+  // but upstream's state needs a velocity for IMU preintegration and deskew.
+  prior.velocities.assign(count, Eigen::Vector3d::Zero());
+  for (std::size_t i = 0; i < count; ++i) {
+    const std::size_t lo = (i == 0) ? 0 : i - 1;
+    const std::size_t hi = (i + 1 < count) ? i + 1 : i;
+    const double dt = prior.stamps[hi] - prior.stamps[lo];
+    if (dt > 0.0) {
+      prior.velocities[i] = (prior.positions[hi] - prior.positions[lo]) / dt;
+    }
+  }
+}
+
+bool has_prior_trajectory() {
+  auto& prior = prior_trajectory();
+  std::lock_guard<std::mutex> lock(prior.mutex);
+  return !prior.stamps.empty();
+}
+
+bool prior_covers(double stamp_begin, double stamp_end) {
+  auto& prior = prior_trajectory();
+  std::lock_guard<std::mutex> lock(prior.mutex);
+  if (prior.stamps.empty() || !std::isfinite(stamp_begin) || !std::isfinite(stamp_end)) {
+    return false;
+  }
+  return stamp_begin >= prior.stamps.front() && stamp_end <= prior.stamps.back();
+}
+
+bool prior_pose_at(double stamp,
+                   Eigen::Vector3d* position,
+                   Eigen::Quaterniond* orientation,
+                   Eigen::Vector3d* velocity) {
+  auto& prior = prior_trajectory();
+  std::lock_guard<std::mutex> lock(prior.mutex);
+  const std::size_t count = prior.stamps.size();
+  if (count == 0 || !std::isfinite(stamp)) {
+    return false;
+  }
+  // Outside the prior's span there is nothing to interpolate; the caller falls
+  // back to upstream rather than extrapolating.
+  if (stamp < prior.stamps.front() || stamp > prior.stamps.back()) {
+    return false;
+  }
+
+  const auto upper = std::upper_bound(prior.stamps.begin(), prior.stamps.end(), stamp);
+  std::size_t hi = static_cast<std::size_t>(upper - prior.stamps.begin());
+  if (hi == 0) {
+    hi = 1;
+  }
+  if (hi >= count) {
+    hi = count - 1;
+  }
+  const std::size_t lo = hi - 1;
+
+  const double span = prior.stamps[hi] - prior.stamps[lo];
+  const double u = span > 0.0 ? (stamp - prior.stamps[lo]) / span : 0.0;
+  if (position != nullptr) {
+    *position = prior.positions[lo] + u * (prior.positions[hi] - prior.positions[lo]);
+  }
+  if (orientation != nullptr) {
+    *orientation = prior.orientations[lo].slerp(u, prior.orientations[hi]);
+  }
+  if (velocity != nullptr) {
+    *velocity = prior.velocities[lo] + u * (prior.velocities[hi] - prior.velocities[lo]);
+  }
+  return true;
+}
+
 }  // namespace voxelslam_offline
 
 struct VoxelSlamOptions {
@@ -411,6 +543,12 @@ struct VoxelSlamOptions {
   bool emit_deskewed_points = false;
   bool enable_loop_closure = true;
   bool enable_global_mapping = true;
+
+  // Flattened N x 8 rows of stamp,x,y,z,qx,qy,qz,qw in the IMU frame. Note the
+  // scalar-last quaternion order, which is the native Result layout and not the
+  // scalar-first order used by the benchmark's trajectory.csv files.
+  std::vector<double> prior_trajectory;
+  bool prior_replaces_odometry = false;
 };
 
 struct Result {
@@ -492,6 +630,8 @@ static py::dict metrics_to_dict(const voxelslam_offline::Metrics& d) {
 
   py::dict odometry;
   odometry["degrade_resets"] = d.odometry_degrade_resets;
+  odometry["prior_applied"] = d.odometry_prior_applied;
+  odometry["prior_degenerate_fallback"] = d.odometry_prior_fallback;
   out["odometry"] = odometry;
 
   py::dict loop;
@@ -548,7 +688,8 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
                                bool loop_update_pending,
                                bool loop_reset_pending,
                                bool loop_enabled,
-                               bool gba_enabled) {
+                               bool gba_enabled,
+                               bool gba_idle) {
   py::dict out;
 
   py::dict imu;
@@ -584,6 +725,8 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
   workers["odometry_finished"] = status.odometry_thread_finished;
   workers["loop_finished"] = !loop_enabled || status.loop_thread_finished;
   workers["gba_finished"] = !gba_enabled || status.gba_thread_finished;
+  // Drained, not merely between passes -- see workers_idle().
+  workers["gba_idle"] = !gba_enabled || gba_idle;
   out["workers"] = workers;
 
   return out;
@@ -598,6 +741,9 @@ class VoxelSlam {
     }
     reset_upstream_buffers();
     voxelslam_offline::reset_records(options_.emit_deskewed_points);
+    // Installed before the workers start and left untouched afterwards; an
+    // options set without a prior clears any previous session's.
+    voxelslam_offline::set_prior_trajectory(prior_poses(options_));
     configure_node(options_);
 
     slam_ = std::make_unique<VOXEL_SLAM>(node_);
@@ -701,6 +847,11 @@ class VoxelSlam {
       }
     }
 
+    // Every valid submission receives a ticket and a terminal accounting state,
+    // even when upstream-compatible preprocessing removes every point.
+    const std::uint64_t ticket = ++latest_lidar_ticket_;
+    voxelslam_offline::record_lidar_pushed(ticket);
+
     pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
     cloud->reserve(static_cast<std::size_t>(count));
     for (py::ssize_t i = 0; i < count; ++i) {
@@ -722,8 +873,9 @@ class VoxelSlam {
     }
 
     if (cloud->empty()) {
-      std::fprintf(stderr, "dropping empty lidar sweep at %.9f after filtering\n", stamp);
-      return 0;
+      std::fprintf(stderr, "lidar sweep at %.9f is empty after filtering\n", stamp);
+      voxelslam_offline::record_lidar_processed(ticket, false);
+      return ticket;
     }
 
     std::sort(cloud->begin(), cloud->end(), [](const PointType& a, const PointType& b) {
@@ -735,13 +887,12 @@ class VoxelSlam {
       }
     }
     if (cloud->empty()) {
-      std::fprintf(stderr, "dropping lidar sweep at %.9f: no points within scan_duration\n", stamp);
-      return 0;
+      std::fprintf(stderr, "lidar sweep at %.9f has no points within scan_duration\n", stamp);
+      voxelslam_offline::record_lidar_processed(ticket, false);
+      return ticket;
     }
     const double begin_stamp = stamp_is_end ? stamp - cloud->back().curvature : stamp;
 
-    const std::uint64_t ticket = ++latest_lidar_ticket_;
-    voxelslam_offline::record_lidar_pushed(ticket);
     std::lock_guard<std::mutex> lock(mBuf);
     time_buf.push_back(begin_stamp);
     pcl_buf.push_back(cloud);
@@ -843,14 +994,25 @@ class VoxelSlam {
     while (true) {
       throw_if_thread_error();
       const auto status = voxelslam_offline::snapshot_pipeline_status();
-      if (status.latest_lidar_processed_ticket >= target && loop_closure_idle()) {
+      if (status.latest_lidar_processed_ticket >= target && workers_idle()) {
         return;
       }
+      if (status.odometry_thread_finished &&
+          status.latest_lidar_processed_ticket < target) {
+        throw std::runtime_error(
+            "VoxelSLAM odometry worker exited before processing lidar ticket " +
+            std::to_string(target) + " (latest processed ticket " +
+            std::to_string(status.latest_lidar_processed_ticket) + ")");
+      }
       if (has_timeout && std::chrono::steady_clock::now() - start > timeout) {
-        throw std::runtime_error("timed out waiting for VoxelSLAM lidar processing and loop closure idle");
+        throw std::runtime_error("timed out waiting for VoxelSLAM lidar processing and worker threads idle");
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+  }
+
+  void synchronize(std::uint64_t ticket = 0, double timeout_seconds = -1.0) const {
+    wait_for_processed(ticket, timeout_seconds);
   }
 
   py::list pop_deskewed_scans() const {
@@ -895,7 +1057,10 @@ class VoxelSlam {
     }
     if (slam_) {
       slam_->is_finish = true;
-      slam_->gba_flag = 0;
+      // Wake a loop thread waiting for final GBA without letting it consume a
+      // partial result from a worker that failed.
+      slam_->gba_cancelled = true;
+      slam_->gba_flag = false;
     }
     node_.setParam("finish", true);
     node_.setParam("__shutdown", true);
@@ -917,15 +1082,29 @@ class VoxelSlam {
     }
   }
 
-  bool loop_closure_idle() const {
-    if (!options_.enable_loop_closure || !slam_) {
+  // True once every background worker has drained the work the sweeps fed so far.
+  // The order of the tests matters and must not be rearranged: an idle loop thread
+  // is what guarantees no further keyframe can be queued, so the global-bundle-
+  // adjustment thread's drained flag is only meaningful once it has been read after
+  // that. Reading the flag first would admit a keyframe queued and consumed in
+  // between and report both threads idle while a bottom-up pass was still due.
+  bool workers_idle() const {
+    if (!slam_) {
       return true;
     }
-    std::lock_guard<std::mutex> lock(slam_->mtx_loop);
-    return slam_->buf_lba2loop.empty() &&
-           slam_->loop_processing == 0 &&
-           slam_->loop_detect == 0 &&
-           slam_->reset_flag == 0;
+    if (options_.enable_loop_closure) {
+      std::lock_guard<std::mutex> lock(slam_->mtx_loop);
+      if (!(slam_->buf_lba2loop.empty() &&
+            slam_->loop_processing == 0 &&
+            slam_->loop_detect == 0 &&
+            slam_->reset_flag == 0)) {
+        return false;
+      }
+    }
+    // Drained, not merely between passes: the flag is cleared by whoever queues the
+    // work and re-set only when that thread finds its input empty, so a pass that
+    // has not started yet still reads as busy.
+    return !options_.enable_global_mapping || slam_->gba_quiescent != 0;
   }
 
   std::vector<voxelslam_offline::PoseRecord> current_poses() const {
@@ -945,15 +1124,21 @@ class VoxelSlam {
     }
 
     std::size_t pending_loop_scanposes = 0;
+    bool gba_idle = true;
     bool loop_processing = false;
     bool loop_update_pending = false;
     bool loop_reset_pending = false;
     if (slam_) {
-      std::lock_guard<std::mutex> lock(slam_->mtx_loop);
-      pending_loop_scanposes = slam_->buf_lba2loop.size();
-      loop_processing = slam_->loop_processing != 0;
-      loop_update_pending = slam_->loop_detect != 0;
-      loop_reset_pending = slam_->reset_flag != 0;
+      {
+        std::lock_guard<std::mutex> lock(slam_->mtx_loop);
+        pending_loop_scanposes = slam_->buf_lba2loop.size();
+        loop_processing = slam_->loop_processing != 0;
+        loop_update_pending = slam_->loop_detect != 0;
+        loop_reset_pending = slam_->reset_flag != 0;
+      }
+      // Sampled after the loop-thread state, so a caller polling this dict sees the
+      // same ordering workers_idle() relies on.
+      gba_idle = finished_ || slam_->gba_quiescent != 0;
     }
 
     return status_to_dict(voxelslam_offline::snapshot_pipeline_status(),
@@ -964,7 +1149,8 @@ class VoxelSlam {
                           loop_update_pending,
                           loop_reset_pending,
                           options_.enable_loop_closure,
-                          options_.enable_global_mapping);
+                          options_.enable_global_mapping,
+                          gba_idle);
   }
 
   void configure_node(const VoxelSlamOptions& o) {
@@ -1037,6 +1223,34 @@ class VoxelSlam {
     if (o.enable_loop_closure && !o.enable_global_mapping) {
       throw std::invalid_argument("enable_loop_closure requires enable_global_mapping");
     }
+    if (o.prior_trajectory.size() % 8 != 0) {
+      throw std::invalid_argument("prior_trajectory must be a flattened N x 8 array");
+    }
+    if (o.prior_replaces_odometry && o.prior_trajectory.empty()) {
+      throw std::invalid_argument("prior_replaces_odometry requires a prior_trajectory");
+    }
+    for (std::size_t row = 1; row * 8 < o.prior_trajectory.size(); ++row) {
+      // Interpolation binary-searches the stamps, so a disordered prior would
+      // silently return neighbours that do not bracket the query.
+      if (!(o.prior_trajectory[row * 8] > o.prior_trajectory[(row - 1) * 8])) {
+        throw std::invalid_argument(
+            "prior_trajectory stamps must be strictly increasing (row " +
+            std::to_string(row) + ")");
+      }
+    }
+  }
+
+  static std::vector<voxelslam_offline::PoseRecord> prior_poses(const VoxelSlamOptions& o) {
+    std::vector<voxelslam_offline::PoseRecord> poses;
+    if (!o.prior_replaces_odometry) {
+      return poses;
+    }
+    poses.reserve(o.prior_trajectory.size() / 8);
+    for (std::size_t i = 0; i + 8 <= o.prior_trajectory.size(); i += 8) {
+      const double* row = o.prior_trajectory.data() + i;
+      poses.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]});
+    }
+    return poses;
   }
 
   static void reset_upstream_buffers() {
@@ -1120,7 +1334,9 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("gba_total_max_iter", &VoxelSlamOptions::gba_total_max_iter)
       .def_readwrite("emit_deskewed_points", &VoxelSlamOptions::emit_deskewed_points)
       .def_readwrite("enable_loop_closure", &VoxelSlamOptions::enable_loop_closure)
-      .def_readwrite("enable_global_mapping", &VoxelSlamOptions::enable_global_mapping);
+      .def_readwrite("enable_global_mapping", &VoxelSlamOptions::enable_global_mapping)
+      .def_readwrite("prior_trajectory", &VoxelSlamOptions::prior_trajectory)
+      .def_readwrite("prior_replaces_odometry", &VoxelSlamOptions::prior_replaces_odometry);
 
   py::class_<Result>(m, "Result")
       .def_property_readonly("trajectory", [](const Result& result) {
@@ -1154,6 +1370,11 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("latest_lidar_ticket", &VoxelSlam::latest_lidar_ticket)
       .def("wait_for_processed",
            &VoxelSlam::wait_for_processed,
+           py::arg("ticket") = 0,
+           py::arg("timeout_seconds") = -1.0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("synchronize",
+           &VoxelSlam::synchronize,
            py::arg("ticket") = 0,
            py::arg("timeout_seconds") = -1.0,
            py::call_guard<py::gil_scoped_release>())

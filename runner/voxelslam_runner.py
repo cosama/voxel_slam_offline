@@ -25,7 +25,9 @@ from voxelslam import (
 PROGRESS_INTERVAL = 100
 IMU_TIME_EPSILON_SECONDS = 1e-6
 REQUIRED_TRAILING_IMU_SECONDS = 0.005
-PROCESSING_TIMEOUT_SECONDS = 30.0
+# Offline replay is back-pressured, not wall-clock limited. A slow worker must
+# not turn a valid input into a partial run.
+PROCESSING_TIMEOUT_SECONDS = -1.0
 TRAJECTORY_FRAME_ID = "map"
 TRAJECTORY_CHILD_FRAME_ID = "base_link"
 
@@ -164,6 +166,9 @@ def run_bag(
             scan_duration=runner_config.scan_duration,
             require_all=True,
         )
+        # Whatever push_ready_lidar could not cover is still queued; record it
+        # so an incomplete tail is visible in the manifest rather than silent.
+        unprocessed_tail_sweeps = len(pending_lidar)
         result = slam.finish()
         pipeline_status = slam.status()
         if dense_map is not None:
@@ -193,6 +198,7 @@ def run_bag(
         "lidar_frame": info.lidar_frame,
         "imu_messages": imu_count,
         "lidar_messages": lidar_count,
+        "unprocessed_tail_sweeps": unprocessed_tail_sweeps,
         "poses": int(result.trajectory.shape[0]),
         "trajectory_csv": str(trajectory_csv),
         "pointcloud_ply": str(pointcloud_ply) if pointcloud_ply else None,
@@ -230,15 +236,19 @@ def push_ready_lidar(
             <= scan_end + REQUIRED_TRAILING_IMU_SECONDS + IMU_TIME_EPSILON_SECONDS
         ):
             if require_all:
-                pending_lidar.pop(0)
+                # A bag whose tail lacks trailing IMU is a property of the
+                # recording, not an error we can replay our way out of. Raising
+                # here discarded the whole run's outputs after processing it in
+                # full; the sweeps stay in `pending_lidar` instead and the
+                # caller reports them.
                 print(
-                    "dropping final lidar message without required trailing IMU: "
-                    f"last_imu={last_imu_stamp}, scan_end={scan_end}, "
-                    f"required={REQUIRED_TRAILING_IMU_SECONDS}",
+                    "warning: final lidar messages have no trailing IMU coverage; "
+                    f"leaving {len(pending_lidar)} unprocessed "
+                    f"(last_imu={last_imu_stamp}, scan_end={scan_end}, "
+                    f"required={REQUIRED_TRAILING_IMU_SECONDS})",
                     file=sys.stderr,
                     flush=True,
                 )
-                continue
             break
         pending_lidar.pop(0)
         ticket = slam.push_lidar(
@@ -249,10 +259,9 @@ def push_ready_lidar(
             scan_duration=scan_duration,
             stamp_is_end=stamp_is_end,
         )
-        slam.wait_for_processed(
+        slam.synchronize(
             ticket,
             PROCESSING_TIMEOUT_SECONDS,
-            allow_waiting_for_imu=not require_all,
         )
         if dense_map is not None:
             dense_map.drain_from(slam)

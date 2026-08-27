@@ -73,7 +73,7 @@ ticket = slam.push_lidar(
     relative_times=np.asarray(point_offsets_s, dtype=np.float32),
     intensities=np.asarray(intensities, dtype=np.float32),
 )
-slam.wait_for_processed(ticket)
+slam.synchronize(ticket)
 result = slam.finish()
 
 trajectory = result.trajectory  # Nx8: stamp,x,y,z,qx,qy,qz,qw
@@ -90,6 +90,12 @@ metrics = slam.metrics()
 status = slam.status()
 deskewed_scans = slam.pop_deskewed_scans()
 ```
+
+Deterministic replay requires one producer and one live instance: provide IMU
+lookahead beyond each sweep, push one sweep, then call `synchronize(ticket)`
+before submitting the next. Omitting the barrier preserves asynchronous
+upstream-style processing. Concurrent `push_*()`/`finish()` calls and multiple
+live instances are not supported.
 
 `push_lidar()` expects points in the lidar frame. Per-point `relative_times`
 are seconds from the sweep start. If the input stamp marks the end of the

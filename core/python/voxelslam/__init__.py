@@ -15,6 +15,29 @@ from .ply import BinaryPlyWriter
 from .pointcloud import PointCloudBuffer
 
 
+def _apply_prior_trajectory(options: Any, prior_trajectory: Any) -> None:
+    """Install an Nx8 [stamp, x, y, z, qx, qy, qz, qw] odometry prior.
+
+    Poses must be in the IMU frame, matching what the estimator reports. The
+    quaternion order is scalar-last, as in Result.trajectory -- benchmark
+    trajectory.csv files are scalar-first and must be reordered by the caller.
+    """
+
+    import numpy as np
+
+    poses = np.asarray(prior_trajectory, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1] != 8:
+        raise ValueError(
+            f"prior_trajectory must have shape (N, 8), got {poses.shape}"
+        )
+    if not poses.size:
+        raise ValueError("prior_trajectory is empty")
+    if not np.all(np.isfinite(poses)):
+        raise ValueError("prior_trajectory contains non-finite values")
+    options.prior_trajectory = poses.reshape(-1).tolist()
+    options.prior_replaces_odometry = True
+
+
 class VoxelSlam:
     """Pythonic wrapper around the upstream Voxel-SLAM core.
 
@@ -28,6 +51,7 @@ class VoxelSlam:
         *,
         lidar_to_imu: Any | None = None,
         imu_to_lidar: Any | None = None,
+        prior_trajectory: Any | None = None,
     ) -> None:
         if config is None:
             config = VoxelSlamConfig()
@@ -38,6 +62,11 @@ class VoxelSlam:
             imu_to_lidar=imu_to_lidar,
             lidar_to_imu=lidar_to_imu,
         )
+        # Bulk trajectory data stays out of VoxelSlamConfig for the same reason
+        # extrinsics do: it is per-run input, not a tunable, and callers
+        # serialize the config into run manifests.
+        if prior_trajectory is not None:
+            _apply_prior_trajectory(self.options, prior_trajectory)
         self._core = _CoreVoxelSlam(self.options)
 
     def push_imu(
@@ -137,7 +166,15 @@ class VoxelSlam:
                     and not bool(loop.get("reset_pending", False))
                 )
             )
-            if int(status["lidar"]["latest_processed_ticket"]) >= target and loop_idle:
+            # Read after loop_idle, and never before it: an idle loop thread is what
+            # guarantees no further keyframe can reach the global-BA thread, so its
+            # drained flag only means something once it has been sampled afterwards.
+            gba_idle = bool(workers.get("gba_idle", True))
+            if (
+                int(status["lidar"]["latest_processed_ticket"]) >= target
+                and loop_idle
+                and gba_idle
+            ):
                 return
             odometry = status.get("odometry", {})
             if (
@@ -151,6 +188,21 @@ class VoxelSlam:
                     f"status={status}"
                 )
             time.sleep(0.001)
+
+    def synchronize(
+        self,
+        ticket: int | None = None,
+        timeout_seconds: float = -1.0,
+        *,
+        allow_waiting_for_imu: bool = False,
+    ) -> None:
+        """Wait until the requested sweep and all downstream workers are drained."""
+
+        self.wait_for_processed(
+            ticket,
+            timeout_seconds,
+            allow_waiting_for_imu=allow_waiting_for_imu,
+        )
 
     def pop_deskewed_scans(self) -> list[Any]:
         """Return and clear pending deskewed scan batches.

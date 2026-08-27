@@ -16,21 +16,48 @@ voxelslam.cpp. Every hunk explains its rationale in the staged source with a
 6. Preserve loop-closure acceptance behavior while recording each gate and
    ensure the loop busy flag clears on every iteration exit.
 7. Refuse undersized GBA windows before code that assumes two states.
+8. Order the global-bundle-adjustment thread against the offline host: publish a
+   drained-idle flag the host can wait on, and admit a bottom-up pass only
+   between loop-closure iterations, so how many passes land before a given sweep
+   -- and therefore gba_edges1 and the finalized path -- stops depending on host
+   scheduling. A session reset publishes its completion the same way: the reset
+   flag the host also tests clears only after the new session and that drained
+   flag are installed, so no all-idle state is observable mid-reset.
+9. Close the keyframe races the single mutex left open: make history_kfsize
+   atomic, install a pose-graph result as one critical section, and take the
+   keyframe mutex in keyframe_loading and around every session swap -- covering
+   both per-session vectors, keyframes and scan poses, because the global-BA
+   thread indexes each of them under that mutex.
+10. Move the travelled-distance map prune out of the odometry thread's idle
+   branch, where wall-clock pacing chose the sweep it ran on, into the per-sweep
+   path.
+11. Let an externally supplied odometry prior predict each sweep in place of IMU
+   dead reckoning -- during initialization as well as steady state -- and stand
+   in for the pose only when the IEKF reports a degenerate update, so degenerate
+   geometry does not accumulate toward a reset. Report how often it did both.
+12. Replace fractional POSIX sleep calls, which truncate to zero and busy-spin,
+   with explicit chrono durations, and take them only on iterations that found
+   no work, so consuming a keyframe no longer costs a poll interval. These waits
+   throttle only genuinely idle online workers; offline synchronization still
+   depends solely on published queue/processing/drained state.
 
 Hunks are generated with `diff -U3` and applied with `patch -F0 -p0`; missing
 context is therefore rejected as upstream drift rather than accepted with fuzz.
 
 --- src/voxelslam.cpp
 +++ src/voxelslam.cpp
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,10 @@
  #include "voxelslam.hpp"
  
++#include <chrono>
++#include <thread>
++
 +#include <voxelslam/offline_bridge.hpp>  // voxelslam_bridge: offline host hooks
 +
  using namespace std;
  
  class ResultOutput
-@@ -31,6 +33,10 @@
+@@ -31,6 +36,10 @@
  
    void pub_localtraj(PLV(3) &pwld, double jour, IMUST &x_curr, int cur_session, pcl::PointCloud<PointType> &pcl_path)
    {
@@ -41,7 +68,17 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      pub_odom_func(x_curr);
      pcl::PointCloud<PointType> pcl_send;
      pcl_send.reserve(pwld.size());
-@@ -462,16 +468,9 @@
+@@ -141,7 +150,8 @@
+         if(pl.size() > interval_size)
+         {
+           pub_pl_func(pl, pub);
+-          sleep(0.05);
++          // voxelslam_bridge: POSIX sleep truncates fractional seconds to zero.
++          std::this_thread::sleep_for(std::chrono::duration<double>(0.05));
+           pl.clear();
+         }
+       }
+@@ -462,16 +472,9 @@
    {
      Eigen::Vector3d g0 = xs[0].g;
      Eigen::Vector3d n0 = g0 / g0.norm();
@@ -60,7 +97,22 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      g0 = rot * g0;
  
      Eigen::Vector3d p0 = xs[0].p;
-@@ -734,15 +733,17 @@
+@@ -656,6 +659,14 @@
+         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
+         eigvalue = saes.eigenvalues();
+         is_degrade = eigvalue[0] < 15 ? true : false;
++        // voxelslam_bridge: this veto exists because a window whose plane normals
++        // span too little cannot be resolved from LiDAR geometry alone, and a
++        // vetoed window resets the system and retries. An odometry prior covering
++        // the window resolves it from outside, so the veto is not needed there.
++        // Scope: only the degeneracy clause. The gravity-magnitude check below is
++        // an independent sanity test on the IMU and still applies.
++        if(is_degrade && voxelslam_offline::prior_covers(x_buf.front().t, x_buf.back().t))
++          is_degrade = false;
+ 
+         converge_thre = 0.01;
+         if(converge_flag == 0)
+@@ -734,26 +745,40 @@
    mutex mtx_loop;
    deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
    vector<Keyframe*> *keyframes;
@@ -72,7 +124,19 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
    IMUST dx;
    pcl::PointCloud<PointType>::Ptr pl_kdmap;
    pcl::KdTreeFLANN<PointType> kd_keyframes;
-   int history_kfsize = 0;
+-  int history_kfsize = 0;
++  // voxelslam_bridge: history_kfsize is written by the loop thread and read and
++  // decremented by the odometry thread's keyframe_loading, exactly like the worker
++  // flags above, so a plain int here is a data race, not just a stale read.
++  std::atomic<int> history_kfsize{0};
++  // voxelslam_bridge: publishes whether the global-bundle-adjustment thread has
++  // drained every keyframe it can consume. The offline host steps the pipeline one
++  // sweep at a time and has to be able to wait for this thread; otherwise how many
++  // bottom-up passes land before a given sweep -- and therefore gba_edges1,
++  // topDownProcess and the finalized trajectory -- depends on host scheduling.
++  // Producers clear it (new keyframe, new session, queued global BA) while holding
++  // mtx_keyframe; only the drained-idle paths of thd_globalmapping set it.
++  std::atomic<int> gba_quiescent{1};
    vector<OctoTree*> octos_release;
 -  int reset_flag = 0;
 -  int g_update = 0;
@@ -81,7 +145,21 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
    int thread_num = 5;
    int degrade_bound = 10;
  
-@@ -778,11 +779,14 @@
+   vector<vector<ScanPose*>*> multimap_scanPoses;
+   vector<vector<Keyframe*>*> multimap_keyframes;
+-  volatile int gba_flag = 0;
++  std::atomic<bool> gba_flag{false};
++  std::atomic<bool> gba_cancelled{false};
+   int gba_size = 0;
+   vector<int> cnct_map;
+   mutex mtx_keyframe;
+   PGO_Edges gba_edges1, gba_edges2;
+-  bool is_finish = false;
++  std::atomic<bool> is_finish{false};
+ 
+   vector<string> sessionNames;
+   string bagname, savepath;
+@@ -778,11 +803,14 @@
      n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
      n.param<int>("General/is_save_map", is_save_map, 0);
  
@@ -96,7 +174,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      odom_ekf.imu_topic = imu_topic;
  
      n.param<double>("Odometry/cov_gyr", cov_gyr, 0.1);
-@@ -832,20 +836,22 @@
+@@ -832,20 +860,22 @@
      rand_walk_gyr, rand_walk_gyr, rand_walk_gyr, 
      rand_walk_acc, rand_walk_acc, rand_walk_acc;
  
@@ -130,7 +208,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      }
  
      sws.resize(thread_num);
-@@ -883,7 +889,10 @@
+@@ -883,7 +913,10 @@
        {
          pointVar &pv = pptr->at(i);
          Eigen::Matrix3d phat = hat(pv.pnt);
@@ -142,7 +220,99 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
  
          double sigma_d = 0;
-@@ -1240,11 +1249,18 @@
+@@ -1196,35 +1229,56 @@
+     ap_curr.z = x_curr.p[2];
+     vector<int> vec_idx;
+     vector<float> vec_dis;
+-    kd_keyframes.radiusSearch(ap_curr, 10, vec_idx, vec_dis);
+-
+-    for(int id: vec_idx)
+-    {
+-      int ord_kf = pl_kdmap->points[id].curvature;
+-      if(keyframes->at(id)->exist)
+-      {
+-        Keyframe &kf = *(keyframes->at(id));
+-        IMUST &xx = kf.x0;
+-        PVec pvec; pvec.reserve(kf.plptr->size());
+ 
+-        pointVar pv; pv.var.setZero();
+-        int plsize = kf.plptr->size();
+-        // for(int j=0; j<plsize; j+=2)
+-        for(int j=0; j<plsize; j++)
+-        {
+-          PointType ap = kf.plptr->points[j];
+-          pv.pnt << ap.x, ap.y, ap.z;
+-          pv.pnt = xx.R * pv.pnt + xx.p;
+-          pvec.push_back(pv);
++    // voxelslam_bridge: kd_keyframes, pl_kdmap, the keyframes vector, its exist flags
++    // and history_kfsize are all rebuilt by the loop thread when a pose-graph result is
++    // installed, and the vector itself is grown by that thread on every keyframe, so
++    // reading them here unsynchronised races with a reallocating push_back. Selecting
++    // the keyframe therefore happens under the mutex that guards those writes; the test
++    // above is only a fast path and is rechecked inside. The point transform and the
++    // cut_voxel below stay outside the lock -- they touch surf_map, which belongs to
++    // this thread alone -- so the loop thread is never blocked for a whole insertion.
++    IMUST xx;
++    pcl::PointCloud<PointType>::Ptr plptr;
++    {
++      std::lock_guard<std::mutex> kf_lock(mtx_keyframe);
++      if(history_kfsize <= 0) return;
++      kd_keyframes.radiusSearch(ap_curr, 10, vec_idx, vec_dis);
++
++      for(int id: vec_idx)
++      {
++        int ord_kf = pl_kdmap->points[id].curvature;
++        if(keyframes->at(id)->exist)
++        {
++          Keyframe &kf = *(keyframes->at(id));
++          // voxelslam_bridge: copy the pose and share the cloud out of the critical
++          // section. Claiming the keyframe here rather than after the insertion keeps
++          // the claim atomic with the search that found it; there is one consumer, so
++          // the keyframe chosen and the map that results are unchanged.
++          xx = kf.x0;
++          plptr = kf.plptr;
++          kf.exist = 0;
++          history_kfsize--;
++          break;
+         }
+-
+-        cut_voxel(surf_map, pvec, win_size, jour);
+-        kf.exist = 0;
+-        history_kfsize--;
+-        break;
+       }
+     }
+-    
++
++    if(plptr == nullptr) return;
++    PVec pvec; pvec.reserve(plptr->size());
++
++    pointVar pv; pv.var.setZero();
++    int plsize = plptr->size();
++    // for(int j=0; j<plsize; j+=2)
++    for(int j=0; j<plsize; j++)
++    {
++      PointType ap = plptr->points[j];
++      pv.pnt << ap.x, ap.y, ap.z;
++      pv.pnt = xx.R * pv.pnt + xx.p;
++      pvec.push_back(pv);
++    }
++
++    cut_voxel(surf_map, pvec, win_size, jour);
+   }
+ 
+   int initialization(deque<sensor_msgs::Imu::Ptr> &imus, Eigen::MatrixXd &hess, LidarFactor &voxhess, PLV(3) &pwld, pcl::PointCloud<PointType>::Ptr pcl_curr)
+@@ -1234,17 +1288,35 @@
+     static vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
+ 
+     pcl::PointCloud<PointType>::Ptr orig(new pcl::PointCloud<PointType>(*pcl_curr));
++    // voxelslam_bridge: same snapshot as the steady-state path -- odom_ekf.process
++    // propagates x_curr in place, so the state an odometry prior composes onto has
++    // to be captured before it is overwritten.
++    IMUST x_prior_ref = x_curr;
+     if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
+       return 0;
+ 
      if(win_count == 0)
        imupre_scale_gravity = odom_ekf.scale_gravity;
  
@@ -155,13 +325,20 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      double downkd = down_size >= 0.5 ? down_size : 0.5;
      down_sampling_voxel(*pcl_curr, downkd);
      var_init(extrin_para, *pcl_curr, pptr, dept_err, beam_err);
++    // voxelslam_bridge: seed the initialization window from the prior too, not just
++    // steady state. motion_init rejects the window when the gravity magnitude it
++    // solves for leaves [9.6, 10.0] or the window is geometrically degenerate, and
++    // both verdicts follow from how good these poses are; a failed window resets the
++    // system and retries, which is where the surviving resets come from. This only
++    // seeds -- motion_init still solves gravity and still applies its own checks.
++    voxelslam_offline::apply_prior_delta(x_curr, x_prior_ref, x_prior_ref.t, x_curr.t);
      lio_state_estimation_kdtree(pptr);
 +    if(dense_deskewed_scan)
 +      voxelslam_offline::record_dense_deskewed_scan(*dense_deskewed_scan, x_curr, extrin_para);
  
      pwld.clear();
      pvec_update(pptr, x_curr, pwld);
-@@ -1302,7 +1318,8 @@
+@@ -1302,7 +1374,8 @@
      odom_ekf.mean_acc.setZero();
      odom_ekf.init_num = 0;
      odom_ekf.IMU_init(imus);
@@ -171,17 +348,62 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
      for(int i=0; i<imu_pre_buf.size(); i++)
        delete imu_pre_buf[i];
-@@ -1516,6 +1533,8 @@
-             {
-               octos.push_back(iter->second);
-               iter->second->tras_ptr(octos);
-+              // voxelslam_bridge: erase the parallel index before freeing its octree pointer.
-+              surf_map_slide.erase(iter->first);
-               surf_map.erase(iter++);
-             }
+@@ -1480,7 +1553,10 @@
+         loop_update(); last_pos = x_curr.p; jour = 0;
+       }
+       
+-      n.param<bool>("finish", is_finish, false);
++      // voxelslam_bridge: host and odometry threads share finish state atomically.
++      bool finish_requested = false;
++      n.param<bool>("finish", finish_requested, false);
++      if(finish_requested) is_finish = true;
+       if(is_finish)
+       {
+         break;
+@@ -1500,31 +1576,11 @@
            }
-@@ -1538,8 +1557,9 @@
-         sleep(0.001);
+           malloc_trim(0);
+         }
+-        else if(release_flag)
+-        {
+-          release_flag = false;
+-          vector<OctoTree*> octos;
+-          for(auto iter=surf_map.begin(); iter!=surf_map.end();)
+-          {
+-            int dis = jour - iter->second->jour;
+-            if(dis < 700)
+-            // if(dis < 200)
+-            {
+-              iter++;
+-            }
+-            else
+-            {
+-              octos.push_back(iter->second);
+-              iter->second->tras_ptr(octos);
+-              surf_map.erase(iter++);
+-            }
+-          }
+-          int ocsize = octos.size();
+-          for(int i=0; i<ocsize; i++)
+-            delete octos[i];
+-          octos.clear();
+-          malloc_trim(0);
+-        }
++        // voxelslam_bridge: the travelled-distance map prune used to be the next arm of
++        // this chain. Which idle iteration reached it was decided by host pacing, and
++        // the octos_release drain above starves it for as long as that has work, so the
++        // sweep it landed on was not a property of the input. It runs in the per-sweep
++        // path now; only the memory-only drains are left here.
+         else if(sws[0].size() > 10000)
+         {
+           for(int i=0; i<500; i++)
+@@ -1535,11 +1591,13 @@
+           malloc_trim(0);
+         }
+ 
+-        sleep(0.001);
++        // voxelslam_bridge: throttle an idle online worker without using sleep(0).
++        std::this_thread::sleep_for(std::chrono::duration<double>(0.001));
          continue;
        }
 -
@@ -191,7 +413,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        if (first_flag)
        {
          pcl::PointCloud<PointType> pl;
-@@ -1558,18 +1578,30 @@
+@@ -1558,18 +1616,34 @@
          if(init == 1)
          {
            motion_init_flag = 0;
@@ -213,6 +435,10 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        }
        else
        {
++        // voxelslam_bridge: odom_ekf.process propagates x_curr in place, so the last
++        // accepted state -- the one an odometry prior composes its delta onto, and
++        // whose stamp bounds that delta -- must be captured before it is overwritten.
++        IMUST x_prior_ref = x_curr;
 +        // voxelslam_bridge: failed preprocessing still completes the host-side ticket.
          if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
 +        {
@@ -222,7 +448,38 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          pcl::PointCloud<PointType> pl_down = *pcl_curr;
          down_sampling_voxel(pl_down, down_size);
-@@ -1590,6 +1622,9 @@
+@@ -1583,13 +1657,40 @@
+         PVecPtr pptr(new PVec);
+         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
+ 
++        // voxelslam_bridge: an installed odometry prior replaces IMU dead reckoning
++        // as this sweep's prediction, but does not replace registration: the pose
++        // used for map insertion below must still be snapped to the map, or the
++        // prior's own drift is baked into the voxels before local BA can see it.
++        // The prior is applied as a delta from the last accepted state, never as an
++        // absolute pose -- its world frame is anchored by its own initialization and
++        // is not upstream's. lio_state_estimation then takes the warm-started pose
++        // as its prior mean, exactly as it took the IMU-propagated one, and
++        // x_curr.cov is left propagating so that weighting keeps its usual meaning.
++        const bool primed = voxelslam_offline::apply_prior_delta(
++            x_curr, x_prior_ref, x_prior_ref.t, x_curr.t);
++
+         if(lio_state_estimation(pptr))
+         {
++          if(primed) voxelslam_offline::record_prior_applied(false);
+           if(degrade_cnt > 0) degrade_cnt--;
+         }
++        else if(primed)
++        {
++          voxelslam_offline::record_prior_applied(true);
++          // voxelslam_bridge: the plane normals are rank-deficient, so the update
++          // just applied is unconstrained in at least one direction. Fall back to
++          // the prior's motion, which carries through the degeneracy, and do not
++          // count this sweep toward a reset.
++          voxelslam_offline::apply_prior_delta(
++              x_curr, x_prior_ref, x_prior_ref.t, x_curr.t);
++          degrade_cnt = 0;
++        }
          else
            degrade_cnt++;
  
@@ -232,7 +489,51 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          pwld.clear();
          pvec_update(pptr, x_curr, pwld);
          ResultOutput::instance().pub_localtraj(pwld, jour, x_curr, sessionNames.size()-1, pcl_path);
-@@ -1617,6 +1652,9 @@
+@@ -1605,6 +1706,43 @@
+           imu_pre_buf[win_count-2]->push_imu(imus);
+         }
+         
++        // voxelslam_bridge: pruning voxels more than 700 m of travel behind the current
++        // pose used to sit in the idle branch of this loop, so the sweep it landed on --
++        // and therefore which sweeps saw the pruned map -- was decided by how often
++        // sync_packages happened to come up empty, i.e. by host pacing. Offline the
++        // input is a fixed sequence, so the prune is tied to the first sweep after the
++        // one that set release_flag instead. It stays between map updates, the same
++        // position in the cycle the idle branch gave it. The octos_release and sws[0]
++        // drains are left in the idle branch: they only return memory and cannot change
++        // what the map contains.
++        if(release_flag)
++        {
++          release_flag = false;
++          vector<OctoTree*> octos;
++          for(auto iter=surf_map.begin(); iter!=surf_map.end();)
++          {
++            int dis = jour - iter->second->jour;
++            if(dis < 700)
++            // if(dis < 200)
++            {
++              iter++;
++            }
++            else
++            {
++              octos.push_back(iter->second);
++              iter->second->tras_ptr(octos);
++              // voxelslam_bridge: erase the parallel index before freeing its octree pointer.
++              surf_map_slide.erase(iter->first);
++              surf_map.erase(iter++);
++            }
++          }
++          int ocsize = octos.size();
++          for(int i=0; i<ocsize; i++)
++            delete octos[i];
++          octos.clear();
++          malloc_trim(0);
++        }
++
+         keyframe_loading(jour);
+         voxhess.clear(); voxhess.win_size = win_size;
+ 
+@@ -1617,6 +1755,9 @@
  
          if(degrade_cnt > degrade_bound)
          {
@@ -242,7 +543,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            degrade_cnt = 0;
            system_reset(imus);
  
-@@ -1630,6 +1668,8 @@
+@@ -1630,6 +1771,8 @@
            motion_init_flag = 1;
            history_kfsize = 0;
  
@@ -251,7 +552,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            continue;
          }
        }
-@@ -1711,6 +1751,9 @@
+@@ -1711,6 +1854,9 @@
  
          win_base += mgsize; win_count -= mgsize;
        }
@@ -261,7 +562,50 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        
        double t_end = ros::Time::now().toSec();
        double mem = get_memory();
-@@ -1875,8 +1918,13 @@
+@@ -1830,8 +1976,15 @@
+     STDescManager *std_manager = new STDescManager(config_setting);
+     sessionNames.push_back(bagname);
+     std_managers.push_back(std_manager);
++    // voxelslam_bridge: multimap_scanPoses and multimap_keyframes are both read by the
++    // global-BA thread, which is already running, so growing either is a write that mutex
++    // has to cover -- that thread indexes multimap_scanPoses under it while it snapshots
++    // the final poses. Publishing a session also ends whatever drained state it reached.
++    mtx_keyframe.lock();
+     multimap_scanPoses.push_back(scanPoses);
+     multimap_keyframes.push_back(keyframes);
++    gba_quiescent = 0;
++    mtx_keyframe.unlock();
+     juds.push_back(jud_default);
+     vector<double> jours(std_managers.size(), 0);
+ 
+@@ -1855,15 +2008,25 @@
+     {
+       if(reset_flag == 1)
+       {
+-        reset_flag = 0;
+         scanPoses->insert(scanPoses->end(), buf_lba2loop_tem.begin(), buf_lba2loop_tem.end());
+         for(ScanPose *bl: buf_lba2loop_tem) bl->pvec = nullptr;
+         buf_lba2loop_tem.clear();
+ 
++        // voxelslam_bridge: the keyframes and scanPoses pointers are themselves followed
++        // by the odometry thread -- keyframe_loading and loop_update respectively -- and
++        // both vectors of sessions are walked by the global-BA thread, so allocating a
++        // session and publishing it is one write under mtx_keyframe rather than four
++        // unsynchronised ones. multimap_scanPoses matters as much as multimap_keyframes
++        // here: the global-BA thread indexes it under this mutex while snapshotting the
++        // final poses, so a reset growing it outside could reallocate the buffer that
++        // thread is walking. The new session is also new work for the global-BA thread.
++        mtx_keyframe.lock();
+         keyframes = new vector<Keyframe*>();
+         multimap_keyframes.push_back(keyframes);
+         scanPoses = new vector<ScanPose*>();
+         multimap_scanPoses.push_back(scanPoses);
++        gba_quiescent = 0;
++        mtx_keyframe.unlock();
+ 
+         bl_local.clear(); buf_base = 0; 
+         std_manager->config_setting_.skip_near_num_ = -(std_manager->plane_cloud_vec_.size()+10);
+@@ -1875,8 +2038,13 @@
          jours.push_back(0);
  
          bagname = sessionNames.back();
@@ -277,18 +621,60 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
          ResultOutput::instance().pub_globalmap(multimap_keyframes, ids, pub_pmap);
-@@ -1901,9 +1949,20 @@
-       {
-         bl_head = buf_lba2loop.front();
-         buf_lba2loop.pop_front();
-+        // voxelslam_bridge: make an in-flight loop job visible to finish()/status().
-+        loop_processing = 1;
+@@ -1884,26 +2052,49 @@
+         initial.clear(); graph = gtsam::NonlinearFactorGraph();
+         ids.clear(); ids.push_back(std_managers.size()-1); 
+         stepsizes.clear(); stepsizes.push_back(0); stepsizes.push_back(0);
++        // voxelslam_bridge: publish the end of the reset only once the new session is
++        // fully installed. workers_idle() in the offline host tests this flag and then
++        // gba_quiescent; clearing it at the top of this block left a window in which
++        // every worker flag read idle while gba_quiescent was still the stale 1 from the
++        // previous session, so synchronize() could return mid-reset and host pacing --
++        // not published state -- decided whether the next sweep saw the old session or
++        // the new one. Ordering suffices, no extra lock: this store follows the release
++        // of mtx_keyframe above, and the global-BA thread reads the flag while holding
++        // that mutex, so observing zero there implies the installed session is visible.
++        // The odometry side of the handshake is unchanged and must stay that way: it
++        // raises this flag before it reports the sweep processed.
++        reset_flag = 0;
        }
-       mtx_loop.unlock();
-       if(bl_head == nullptr) continue;
+ 
+-      if(is_finish && buf_lba2loop.empty())
++      ScanPose *bl_head = nullptr;
+       {
+-        break;
++        std::lock_guard<std::mutex> loop_lock(mtx_loop);
++        if(is_finish && buf_lba2loop.empty())
++        {
++          break;
++        }
++        if(!buf_lba2loop.empty() && loop_detect == 0)
++        {
++          bl_head = buf_lba2loop.front();
++          buf_lba2loop.pop_front();
++          // voxelslam_bridge: make an in-flight loop job visible to finish()/status().
++          loop_processing = 1;
++        }
+       }
+-
+-      if(buf_lba2loop.empty() || loop_detect == 1)
++      if(bl_head == nullptr)
+       {
+-        sleep(0.01); continue;
++        std::this_thread::sleep_for(std::chrono::duration<double>(0.01));
++        continue;
+       }
+-      ScanPose *bl_head = nullptr;
+-      mtx_loop.lock();
+-      if(!buf_lba2loop.empty()) 
 +      // voxelslam_bridge: clear the busy flag on every exit path from this iteration.
 +      struct LoopProcessingGuard
-+      {
+       {
+-        bl_head = buf_lba2loop.front();
+-        buf_lba2loop.pop_front();
+-      }
+-      mtx_loop.unlock();
+-      if(bl_head == nullptr) continue;
 +        VOXEL_SLAM *slam;
 +        ~LoopProcessingGuard()
 +        {
@@ -298,7 +684,20 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
        int cur_id = std_managers.size() - 1;
        scanPoses->push_back(bl_head);
-@@ -1990,12 +2049,16 @@
+@@ -1974,6 +2165,12 @@
+       }
+       mtx_keyframe.lock();
+       keyframes->push_back(smp);
++      // voxelslam_bridge: a queued keyframe is work for the global-BA thread, so the
++      // drained state it may have published is no longer true. Clearing it here, inside
++      // the same critical section as the push and before that thread can observe the
++      // keyframe, is what makes the flag safe to wait on: it can only read as drained
++      // if no keyframe has been queued since that thread last emptied its input.
++      gba_quiescent = 0;
+       mtx_keyframe.unlock();
+ 
+       vector<STD> stds_vec;
+@@ -1990,12 +2187,16 @@
  
          if(search_result.first >= 0)
          {
@@ -315,7 +714,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            if(icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval))
            {
              int ord_bl = std_managers[id]->plane_cloud_vec_[search_result.first]->header.seq;
-@@ -2008,9 +2071,12 @@
+@@ -2008,9 +2209,12 @@
              if(id == cur_id)
              {
                double span = smp->jour - keyframes->at(search_result.first)->jour;
@@ -329,7 +728,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                {
                  isPush = true;
                  step = stepsizes.size() - 2;
-@@ -2041,7 +2107,10 @@
+@@ -2041,7 +2245,10 @@
                }
                else
                {
@@ -341,7 +740,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                  {
                    jours[id] = 1e-6; // set to 0
                    isPush = true;
-@@ -2059,6 +2128,8 @@
+@@ -2059,6 +2266,8 @@
              {
                match_num++;
                lp_edges.push(id, cur_id, ord_bl, buf_base-1, loop_transform.second, loop_transform.first, v6_init);
@@ -350,7 +749,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                if(step > -1)
                {
                  int id1 = stepsizes[step] + ord_bl;
-@@ -2096,6 +2167,8 @@
+@@ -2096,10 +2305,25 @@
          for(int i=0; i<5; i++) isam.update();
          gtsam::Values results = isam.calculateEstimate();
          int resultsize = results.size();
@@ -359,25 +758,151 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          
          IMUST x1 = scanPoses->at(buf_base-1)->x;
          int idsize = ids.size();
-@@ -2166,6 +2239,8 @@
+ 
++        // voxelslam_bridge: installing a pose-graph result rewrites every scan pose,
++        // every keyframe pose, the exist flags, the keyframe kd-tree, its point index
++        // and history_kfsize. keyframe_loading reads exactly that set and the global-BA
++        // thread snapshots the keyframe poses, so the install has to be one critical
++        // section. The previous lock covered only the x0 loop, which left the kd-tree,
++        // pl_kdmap, history_kfsize and the exist flags unsynchronised and let a reader
++        // observe half-installed state -- a keyframe search against a stale kd-tree
++        // resolved through freshly optimized poses. The cut_voxel calls below build
++        // map_loop, which no other thread touches; keeping them inside costs at most one
++        // delayed keyframe load per optimization and buys an all-or-nothing install.
++        // Scoped rather than a bare lock()/unlock() pair because the gtsam calls inside
++        // can throw, and a mutex left held here would hang every other thread.
++        std::unique_lock<std::mutex> install_lock(mtx_keyframe);
+         history_kfsize = 0;
+         for(int ii=0; ii<idsize; ii++)
+         {
+@@ -2110,15 +2334,16 @@
+             multimap_scanPoses[tip]->at(ord)->set_state(results.at(j).cast<gtsam::Pose3>());
+           }
+         }
+-        mtx_keyframe.lock();
+         for(int ii=0; ii<idsize; ii++)
+         {
+           int tip = ids[ii];
+           for(Keyframe *kf: *multimap_keyframes[tip])
+             kf->x0 = multimap_scanPoses[tip]->at(kf->id)->x;
+         }
+-        mtx_keyframe.unlock();
+ 
++        // voxelslam_bridge: the unlock that used to sit here is now taken after the
++        // keyframe kd-tree and its index have been rebuilt, so readers see the whole
++        // install or none of it.
+         initial.clear();
+         for(int i=0; i<resultsize; i++)
+           initial.insert(i, results.at(i).cast<gtsam::Pose3>());
+@@ -2165,7 +2390,10 @@
+           kd_keyframes.setInputCloud(pl_kdmap);
            history_kfsize = pl_kdmap->size();
          }
++        install_lock.unlock();
          loop_detect = 1;
 +        // voxelslam_bridge: publish completion after optimized poses/map state are installed.
 +        voxelslam_offline::record_loop_update_applied();
  
          vector<int> ids2 = ids; ids2.pop_back();
          ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids2);
-@@ -2233,6 +2308,8 @@
-     cnct_map = ids;
-     gba_size = multimap_keyframes.back()->size();
-     gba_flag = 1;
+@@ -2183,15 +2411,19 @@
+ 
+     if(is_finish)
+     {
+-      if(keyframes->empty())
+       {
+-        sessionNames.pop_back();
+-        std_managers.pop_back();
+-        multimap_scanPoses.pop_back();
+-        multimap_keyframes.pop_back();
+-        juds.pop_back();
+-        jours.pop_back();
+-        relc_counts.pop_back();
++        // voxelslam_bridge: the GBA thread can still inspect the session list here.
++        std::lock_guard<std::mutex> keyframe_lock(mtx_keyframe);
++        if(keyframes->empty())
++        {
++          sessionNames.pop_back();
++          std_managers.pop_back();
++          multimap_scanPoses.pop_back();
++          multimap_keyframes.pop_back();
++          juds.pop_back();
++          jours.pop_back();
++          relc_counts.pop_back();
++        }
+       }
+ 
+       if(multimap_keyframes.empty()) 
+@@ -2213,15 +2445,23 @@
+       FileReaderWriter::instance().pgo_edges_io(lp_edges, sessionNames, 1, savepath, bagname);
+     }
+ 
+-    for(int i=0; i<multimap_scanPoses.size(); i++)
+-    {
+-      for(int j=0; j<multimap_scanPoses[i]->size(); j++)
+-        delete multimap_scanPoses[i]->at(j);
+-    }
+-    for(int i=0; i<multimap_keyframes.size(); i++)
+     {
+-      for(int j=0; j<multimap_keyframes[i]->size(); j++)
+-        delete multimap_keyframes[i]->at(j);
++      // voxelslam_bridge: GBA publishes quiescence before completing the final
++      // request. Rechecking it while holding the container mutex keeps that
++      // thread out while the loop thread releases the shared session objects.
++      std::lock_guard<std::mutex> keyframe_lock(mtx_keyframe);
++      if(gba_quiescent == 0)
++        throw std::runtime_error("global mapping was not quiescent during loop cleanup");
++      for(int i=0; i<multimap_scanPoses.size(); i++)
++      {
++        for(int j=0; j<multimap_scanPoses[i]->size(); j++)
++          delete multimap_scanPoses[i]->at(j);
++      }
++      for(int i=0; i<multimap_keyframes.size(); i++)
++      {
++        for(int j=0; j<multimap_keyframes[i]->size(); j++)
++          delete multimap_keyframes[i]->at(j);
++      }
+     }
+     
+     malloc_trim(0);
+@@ -2230,9 +2470,20 @@
+   // The top down process of HBA
+   void topDownProcess(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, vector<int> &ids, vector<int> &stepsizes)
+   {
+-    cnct_map = ids;
+-    gba_size = multimap_keyframes.back()->size();
+-    gba_flag = 1;
++    {
++      // voxelslam_bridge: publish the final-GBA request and all of its payload
++      // under the mutex used by the consumer. gba_flag is the release/acquire
++      // handoff and remains true until cnct_map/gba_size are no longer in use.
++      std::lock_guard<std::mutex> keyframe_lock(mtx_keyframe);
++      if(gba_cancelled)
++        throw std::runtime_error("global mapping is unavailable for final optimization");
++      cnct_map = ids;
++      gba_size = multimap_keyframes.back()->size();
++      gba_quiescent = 0;
++      gba_flag = true;
++    }
 +    // voxelslam_bridge: bracket global bundle adjustment for status and timing metrics.
 +    voxelslam_offline::record_gba_started(gba_size);
  
      pcl::PointCloud<PointType> pl0;
      pub_pl_func(pl0, pub_pmap);
-@@ -2300,6 +2377,8 @@
+@@ -2242,7 +2493,11 @@
+     pub_pl_func(pl0, pub_scan);
+ 
+     double t0 = ros::Time::now().toSec();
+-    while(gba_flag);
++    // voxelslam_bridge: wait on the atomic request state, never on worker timing.
++    while(gba_flag)
++      std::this_thread::sleep_for(std::chrono::duration<double>(0.001));
++    if(gba_cancelled)
++      throw std::runtime_error("global mapping stopped before completing final optimization");
+     
+     for(PGO_Edge &edge: gba_edges1.edges)
+     {
+@@ -2300,6 +2555,8 @@
      Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
  
      double t1 = ros::Time::now().toSec();
@@ -386,7 +911,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      printf("GBA opt: %lfs\n", t1 - t0);
  
      for(int ii=0; ii<idsize; ii++)
-@@ -2310,6 +2389,8 @@
+@@ -2310,6 +2567,8 @@
      }
  
      ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
@@ -395,7 +920,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      vector<int> ids2 = ids; ids2.pop_back();
      ResultOutput::instance().pub_globalmap(multimap_keyframes, ids2, pub_pmap);
      ids2.clear(); ids2.push_back(ids.back());
-@@ -2348,6 +2429,9 @@
+@@ -2348,6 +2607,9 @@
      }
      
      int wdsize = smps.size();
@@ -405,7 +930,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      Eigen::MatrixXd hess;
      vector<double> gba_eigen_value_array_orig = gba_eigen_value_array;
      double gba_min_eigen_value_orig = gba_min_eigen_value;
-@@ -2382,9 +2466,11 @@
+@@ -2382,9 +2644,11 @@
        opt_lsv.thd_num = thread_num;
        vector<double> resis;
        bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
@@ -419,4 +944,215 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        {
          converge_thre = 0.01;
          if(converge_flag == 0)
-
+@@ -2502,54 +2766,129 @@
+ 
+     while(n.ok())
+     {
+-      if(multimap_keyframes.empty())
+-      {
+-        sleep(0.1); continue;
++      // voxelslam_bridge: nothing has been queued since this thread last drained, so no
++      // pass can be due and the gate below would only re-derive that. Skipping it keeps
++      // idle polling off mtx_keyframe, which the odometry and loop threads need.
++      // Producers clear this flag while holding that mutex and before the work they
++      // queue becomes reachable here, so a keyframe can never be missed by this test.
++      if(gba_quiescent != 0)
++      {
++        std::this_thread::sleep_for(std::chrono::duration<double>(0.001)); continue;  // voxelslam_bridge: 1 ms, matching the odometry/loop polls -- the offline host now blocks on this thread's quiescence, so this interval is replay latency, not idle cost.
+       }
+ 
++      // voxelslam_bridge: the loop thread rewrites the very keyframe poses this thread
++      // snapshots. Admitting a pass only between loop-closure iterations pins it to a
++      // settled pose set instead of to whichever side of a pose-graph install won the
++      // race. The actual decision below holds mtx_loop through the snapshot, so a
++      // new loop iteration cannot start between the idle test and pose copy.
+       int smp_flag = 0;
+-      if(smp_mp+1 < multimap_keyframes.size() && !multimap_keyframes.back()->empty())
+-        smp_flag = 1;
+-
+-      vector<Keyframe*> &smps = *multimap_keyframes[smp_mp];
+       int total_ba = 0;
+-      if(gba_flag == 1 && smp_mp >= cnct_map.back() && gba_size <= buf_base)
+-      {
+-        printf("gba_flag enter: %d\n", gba_flag);
+-        total_ba = 1;
+-      }
+-      else if(smps.size() <= buf_base)
+-      {
+-        if(smp_flag == 0)
+-        {
+-          sleep(0.1); continue;
++      int run_pass = 0;
++      int consumed_kf = 0;
++      size_t smps_size = 0;
++      vector<IMUST> xs;
++      vector<Keyframe*> smp_local;
++      // voxelslam_bridge: multimap_keyframes, the keyframe list inside it and the poses
++      // it holds are all written by the loop thread, so the admission decision, the
++      // keyframe this pass consumes and the pose snapshot it runs on are taken under a
++      // single hold of mtx_keyframe. The lock that used to cover only the snapshot left
++      // the decision and the snapshot free to straddle a pose-graph install.
++      {
++        // voxelslam_bridge: hold the loop queue mutex through admission and the
++        // pose snapshot. An empty queue plus loop_processing==0 is then stable:
++        // the loop thread cannot start another pose-changing iteration between
++        // the test and snapshot. Lock order is always loop, then keyframe.
++        std::unique_lock<std::mutex> loop_lock(mtx_loop);
++        std::lock_guard<std::mutex> gba_lock(mtx_keyframe);
++        if(gba_quiescent != 0)
++        {
++          run_pass = -1;
++        }
++        else if(!buf_lba2loop.empty() || loop_processing != 0 ||
++                loop_detect != 0 || reset_flag != 0)
++        {
++          run_pass = -1;
++        }
++        else if(multimap_keyframes.empty())
++        {
++          // voxelslam_bridge: drained -- no session has been opened yet.
++          if(gba_flag == 0) gba_quiescent = 1;
++          run_pass = -1;
+         }
+-      }
+-      else
+-      {
+-        smps[buf_base]->mp = smp_mp;
+-        localID.push_back(buf_base);
+-
+-        buf_base++;
+-        if(localID.size() < wdsize)
++        else
+         {
+-          sleep(0.1); continue;
++          if(smp_mp+1 < multimap_keyframes.size() && !multimap_keyframes.back()->empty())
++            smp_flag = 1;
++
++          vector<Keyframe*> &smps = *multimap_keyframes[smp_mp];
++          smps_size = smps.size();
++          if(gba_flag == 1 && smp_mp >= cnct_map.back() && gba_size <= buf_base)
++          {
++            printf("gba_flag enter: %d\n", static_cast<int>(gba_flag.load()));
++            total_ba = 1;
++          }
++          else if(smps.size() <= buf_base)
++          {
++            if(smp_flag == 0)
++            {
++              // voxelslam_bridge: every keyframe on offer has been consumed and every
++              // pass they enable has finished. This -- not merely being between passes --
++              // is the drained state the offline host waits on before it feeds the next
++              // sweep. It is withheld while a global BA is queued, so the host cannot be
++              // told this thread is idle before topDownProcess has been served.
++              if(gba_flag == 0) gba_quiescent = 1;
++              run_pass = -1;
++            }
++          }
++          else
++          {
++            smps[buf_base]->mp = smp_mp;
++            localID.push_back(buf_base);
++
++            buf_base++;
++            if(localID.size() < wdsize)
++            {
++              // voxelslam_bridge: a keyframe was consumed but the window is not full, so
++              // this thread is not idle and must not sleep before re-deriving its state.
++              // Quiescence is deliberately not published here: further keyframes may
++              // already be queued for this session and no producer would clear the flag
++              // again for them, so publishing drained now could tell the host this thread
++              // is finished while a pass is still due. Only the branch that verified the
++              // input is empty may publish it.
++              consumed_kf = 1;
++              run_pass = -1;
++            }
++          }
++
++          if(run_pass == 0)
++          {
++            run_pass = 1;
++            for(int i: localID)
++            {
++              xs.push_back(multimap_keyframes[smp_mp]->at(i)->x0);
++              smp_local.push_back(multimap_keyframes[smp_mp]->at(i));
++            }
++          }
+         }
+       }
+ 
+-      vector<IMUST> xs;
+-      vector<Keyframe*> smp_local;
+-      mtx_keyframe.lock();
+-      for(int i: localID)
++      if(run_pass != 1)
+       {
+-        xs.push_back(multimap_keyframes[smp_mp]->at(i)->x0);
+-        smp_local.push_back(multimap_keyframes[smp_mp]->at(i));
++        // voxelslam_bridge: idle only when this iteration found nothing to consume.
++        // Sleeping after consuming a keyframe deferred the drained flag by a full poll
++        // interval per keyframe, and the offline host pays that directly in
++        // synchronize(); it was free only while the fractional POSIX call this replaced
++        // truncated to zero and never waited at all.
++        if(consumed_kf == 0)
++          std::this_thread::sleep_for(std::chrono::duration<double>(0.001));  // voxelslam_bridge: 1 ms for the same reason as the gate above.
++        continue;
+       }
+-      mtx_keyframe.unlock();
+ 
+       double tg1 = ros::Time::now().toSec();
+ 
+-      Keyframe *gba_smp = new Keyframe(smp_local[0]->x0);
++      // voxelslam_bridge: xs[0] is the same pose, read inside the critical section
++      // instead of chasing the keyframe again after the mutex has been released.
++      Keyframe *gba_smp = new Keyframe(xs[0]);
+       vector<int> mps{smp_mp};
+       HBA_add_edge(xs, smp_local, gba_edges1, mps, 1, 2, gba_smp->plptr);
+       gba_smp->id = smp_local[0]->id;
+@@ -2559,15 +2898,17 @@
+       if(total_ba == 1)
+       {
+         printf("GBAsize: %d\n", gba_size);
+-        vector<IMUST> xs;
+-        mtx_keyframe.lock();
+-        for(Keyframe *smp: gba_submaps)
+         {
+-          xs.push_back(multimap_scanPoses[smp->mp]->at(smp->id)->x);
++          // voxelslam_bridge: copy final poses while their shared storage is locked.
++          vector<IMUST> xs;
++          {
++            std::lock_guard<std::mutex> gba_lock(mtx_keyframe);
++            for(Keyframe *smp: gba_submaps)
++              xs.push_back(multimap_scanPoses[smp->mp]->at(smp->id)->x);
++          }
++          gba_edges2.edges.clear(); gba_edges2.mates.clear();
++          HBA_add_edge(xs, gba_submaps, gba_edges2, cnct_map, total_max_iter, thread_num);
+         }
+-        mtx_keyframe.unlock();
+-        gba_edges2.edges.clear(); gba_edges2.mates.clear();
+-        HBA_add_edge(xs, gba_submaps, gba_edges2, cnct_map, total_max_iter, thread_num);
+ 
+         if(is_finish)
+         {
+@@ -2577,9 +2918,20 @@
+         gba_submaps.clear();
+ 
+         malloc_trim(0);
+-        gba_flag = 0;
++        {
++          // voxelslam_bridge: publish drained before completing the request.
++          // The loop thread acquire-waits on gba_flag and then takes this mutex
++          // before freeing shared session/keyframe storage.
++          std::lock_guard<std::mutex> gba_lock(mtx_keyframe);
++          gba_quiescent = 1;
++          gba_flag = false;
++        }
+       }
+-      else if(smp_flag == 1 && multimap_keyframes[smp_mp]->size() <= buf_base)
++      // voxelslam_bridge: size of the current session's keyframe list as read under
++      // mtx_keyframe above. smp_flag is 1 only when smp_mp is not the session the loop
++      // thread appends to, so the snapshot equals a fresh read and no longer needs an
++      // unsynchronised one.
++      else if(smp_flag == 1 && smps_size <= buf_base)
+       {
+         smp_mp++; buf_base = 0; localID.clear();
+         // printf("switch: %d\n", smp_mp);

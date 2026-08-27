@@ -36,12 +36,18 @@ Core usage:
 slam = voxelslam.VoxelSlam(config, lidar_to_imu=T_imu_lidar)
 slam.push_imu(stamp, [ax, ay, az], [gx, gy, gz])
 ticket = slam.push_lidar(stamp, points_xyz, relative_times, intensities)
-slam.wait_for_processed(ticket)
+slam.synchronize(ticket)
 result = slam.finish()
 ```
 
 `finish()` is for shutdown. For online-style operation, read `latest_pose()`,
 `trajectory()`, `status()`, and `metrics()` while the instance remains active.
+
+Deterministic replay uses one producer and one live `VoxelSlam` instance. Feed
+enough IMU data to extend beyond a sweep, push that sweep, and call
+`synchronize(ticket)` before pushing the next one. Online callers may omit the
+barrier and retain upstream-style asynchronous queue processing. Multiple live
+instances and concurrent `push_*()`/`finish()` calls are not supported.
 
 ## Notes
 

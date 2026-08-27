@@ -45,6 +45,19 @@ void record_pose(double stamp, const Eigen::Vector3d& position, const Eigen::Qua
 void record_optimized_poses(const std::vector<PoseRecord>& poses);
 void record_dense_deskewed_points(const std::vector<PointRecord>& points);
 void record_odometry_reset(double stamp, std::uint64_t lidar_ticket, const std::string& reason);
+
+// Externally supplied odometry prior (a trajectory estimated by another
+// frontend) that stands in for the IEKF pose of each sweep. No prior is
+// installed unless the host provides one, and a stamp outside the prior's
+// time span reports failure so the caller can fall back to upstream.
+void record_prior_applied(bool degenerate_fallback);
+void set_prior_trajectory(std::vector<PoseRecord> poses);
+bool has_prior_trajectory();
+bool prior_covers(double stamp_begin, double stamp_end);
+bool prior_pose_at(double stamp,
+                   Eigen::Vector3d* position,
+                   Eigen::Quaterniond* orientation,
+                   Eigen::Vector3d* velocity);
 void record_loop_candidate(double score);
 void record_loop_score_passed();
 void record_loop_icp_result(double eig0,
@@ -82,6 +95,36 @@ void record_optimized_path(ScanPoseBuffersT& scan_pose_buffers, IdsT& ids) {
     }
   }
   record_optimized_poses(poses);
+}
+
+// Advance `x` from the previously accepted state `x_prev` by the prior's motion
+// between the two sweeps. Deliberately relative: the prior's world frame is
+// anchored by its own gravity/yaw initialization and does not coincide with
+// upstream's, so imposing absolute poses would jump the estimate into a foreign
+// frame. Only the body frame has to agree, and both are the IMU link.
+template <typename StateT>
+bool apply_prior_delta(StateT& x, const StateT& x_prev, double stamp_prev, double stamp) {
+  Eigen::Vector3d p_prev;
+  Eigen::Vector3d p_now;
+  Eigen::Vector3d v_now;
+  Eigen::Quaterniond q_prev;
+  Eigen::Quaterniond q_now;
+  if (!prior_pose_at(stamp_prev, &p_prev, &q_prev, nullptr) ||
+      !prior_pose_at(stamp, &p_now, &q_now, &v_now)) {
+    return false;
+  }
+
+  const Eigen::Quaterniond q_prev_inv = q_prev.conjugate();
+  const Eigen::Quaterniond delta_q = q_prev_inv * q_now;
+  const Eigen::Vector3d delta_p = q_prev_inv * (p_now - p_prev);
+
+  const Eigen::Matrix3d R_prev = x_prev.R;
+  x.R = R_prev * delta_q.toRotationMatrix();
+  x.p = x_prev.p + R_prev * delta_p;
+  // The prior reports velocity in its own world frame; rotate it through the
+  // same alignment that carries the prior's frame onto upstream's at t_prev.
+  x.v = R_prev * (q_prev_inv * v_now);
+  return true;
 }
 
 template <typename CloudT, typename StateT, typename ExtrinsicT>
