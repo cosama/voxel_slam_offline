@@ -50,11 +50,10 @@ config object.
 import numpy as np
 import voxelslam
 
+# VoxelSlamConfig carries upstream Voxel-SLAM parameters and nothing else.
 config = voxelslam.VoxelSlamConfig(
     blind=2.8,
     point_filter_num=3,
-    enable_loop_closure=True,
-    enable_global_mapping=True,
 )
 
 # p_imu = T_imu_lidar @ p_lidar
@@ -65,7 +64,16 @@ lidar_to_imu = np.array([
     [0.0, 0.0, 0.0, 1.0],
 ])
 
-slam = voxelslam.VoxelSlam(config, lidar_to_imu=lidar_to_imu)
+# How this process runs the estimator is passed here, not stored in the config:
+# `enable_loop_closure` and `enable_global_mapping` (both default True) suppress
+# upstream's optional threads for odometry-only ablations, and loop closure
+# requires global mapping.
+slam = voxelslam.VoxelSlam(
+    config,
+    lidar_to_imu=lidar_to_imu,
+    enable_loop_closure=True,
+    enable_global_mapping=True,
+)
 slam.push_imu(stamp, [ax, ay, az], [gx, gy, gz])
 ticket = slam.push_lidar(
     stamp=sweep_start_time,
@@ -80,6 +88,11 @@ trajectory = result.trajectory  # Nx8: stamp,x,y,z,qx,qy,qz,qw
 metrics = result.metrics
 ```
 
+For an external odometry prior, construct with `enable_prior=True` and stream
+`push_prior_pose(stamp, position, [qx, qy, qz, qw], covariance)` alongside the
+sensors. Push one prior pose past each scan end; interpolation never
+extrapolates, and the odometry worker parks until that lookahead exists.
+
 For online-style use, keep one `VoxelSlam` instance alive and do not call
 `finish()` until shutdown:
 
@@ -91,11 +104,18 @@ status = slam.status()
 deskewed_scans = slam.pop_deskewed_scans()
 ```
 
-Deterministic replay requires one producer and one live instance: provide IMU
-lookahead beyond each sweep, push one sweep, then call `synchronize(ticket)`
-before submitting the next. Omitting the barrier preserves asynchronous
-upstream-style processing. Concurrent `push_*()`/`finish()` calls and multiple
-live instances are not supported.
+Deterministic replay requires one producer and one live instance: push one
+sweep, call `synchronize(ticket)`, and when there is no more data call
+`finish()`. That is the whole protocol -- the caller never inspects IMU
+coverage and call order does not matter. `synchronize()` blocks until the
+workers have made all the progress the data submitted so far allows: either the
+sweep completes with every worker drained, or the pipeline is fully quiescent
+and the estimator is parked on a sweep the submitted IMU or prior cannot cover. It takes
+no timeout and has no bypass, so the same input replays identically on any
+machine. A recording whose tail has no trailing IMU is normal, not an error;
+those sweeps are counted in `status()["lidar"]["uncovered"]`. Omitting the call
+preserves asynchronous upstream-style processing. Concurrent
+`push_*()`/`finish()` calls and multiple live instances are not supported.
 
 `push_lidar()` expects points in the lidar frame. Per-point `relative_times`
 are seconds from the sweep start. If the input stamp marks the end of the
@@ -103,8 +123,8 @@ sweep, pass `stamp_is_end=True`.
 
 ## Dense Maps
 
-Set `config.emit_deskewed_points = True` to receive Voxel-SLAM's internally
-deskewed scan points. These batches are not retained by the C++ library; drain
+Pass `VoxelSlam(..., emit_deskewed_points=True)` to receive Voxel-SLAM's
+internally deskewed scan points. These batches are not retained by the C++ library; drain
 them with `pop_deskewed_scans()`.
 
 The helper `DenseMapBuffer` can spool deskewed scans in memory or to a temporary

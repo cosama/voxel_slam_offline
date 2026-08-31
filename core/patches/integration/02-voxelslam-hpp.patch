@@ -2,8 +2,8 @@ voxelslam.hpp -- shared node declarations and inline preprocessing.
 
 1. Add offline host hooks and carry LiDAR tickets through upstream queues.
 2. Retain validated long-duration points instead of silently truncating them.
-3. Make LiDAR dequeue and IMU-readiness observation race-free, expose waiting
-   state, and acknowledge sweeps that upstream consumes without estimator work.
+3. Make LiDAR dequeue and IMU/prior-readiness observation race-free, expose
+   waiting state, and acknowledge sweeps consumed without estimator work.
 4. Replace process termination on missing IMU/map input with catchable errors.
 5. Rotate body-frame attitude covariance into the world frame consistently.
 
@@ -81,16 +81,25 @@ delta is generated with `diff -U3` and applied with zero fuzz.
          return false;
        }
  
-@@ -134,9 +146,19 @@
+@@ -134,9 +146,28 @@
      pl_ready = true;
    }
  
 -  if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
++  // voxelslam_bridge: the causal prior interpolates only between bracketing
++  // samples. Park this sweep until the host has pushed lookahead past its end;
++  // never silently extrapolate or let worker timing decide whether it applies.
++  const bool prior_waiting = pl_ready && !voxelslam_offline::prior_ready_for_sweep(
++      p_imu.pcl_beg_time, p_imu.pcl_end_time);
++  voxelslam_offline::record_odometry_waiting_for_prior(
++      current_lidar_ticket, prior_waiting, p_imu.pcl_beg_time, p_imu.pcl_end_time);
++  if(prior_waiting) return false;
++
 +  // voxelslam_bridge: sample IMU readiness under its producer lock and expose wait state.
 +  mBuf.lock();
 +  double last_imu_time = imu_last_time;
 +  mBuf.unlock();
-+  voxelslam_offline::record_odometry_waiting_for_imu(current_lidar_ticket, pl_ready && last_imu_time <= p_imu.pcl_end_time);
++  voxelslam_offline::record_odometry_waiting_for_imu(current_lidar_ticket, pl_ready && last_imu_time <= p_imu.pcl_end_time, p_imu.pcl_end_time);
 +  if(!pl_ready || last_imu_time <= p_imu.pcl_end_time) return false;
  
    mBuf.lock();
@@ -102,7 +111,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
    double imu_time = imu_buf.front()->header.stamp.toSec();
    while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
    {
-@@ -149,7 +171,8 @@
+@@ -149,7 +180,8 @@
  
    if(imu_buf.empty())
    {
@@ -112,7 +121,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
    }
  
    pl_ready = false;
-@@ -157,7 +180,11 @@
+@@ -157,7 +189,11 @@
    if(imus.size() > 4)
      return true;
    else
@@ -124,7 +133,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
  }
  
  double dept_err, beam_err;
-@@ -208,7 +235,11 @@
+@@ -208,7 +244,11 @@
    for(pointVar &pv: *pptr)
    {
      Eigen::Matrix3d phat = hat(pv.pnt);
@@ -137,7 +146,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
      pwld.push_back(x_curr.R * pv.pnt + x_curr.p);
    }
  }
-@@ -219,8 +250,8 @@
+@@ -219,8 +259,8 @@
    ifstream file(filename);
    if(!file.is_open())
    {
@@ -148,4 +157,3 @@ delta is generated with `diff -U3` and applied with zero fuzz.
    }
  
    string lineStr, str;
-

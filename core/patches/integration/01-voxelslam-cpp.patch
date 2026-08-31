@@ -33,13 +33,38 @@ voxelslam.cpp. Every hunk explains its rationale in the staged source with a
    path.
 11. Let an externally supplied odometry prior predict each sweep in place of IMU
    dead reckoning -- during initialization as well as steady state -- and stand
-   in for the pose only when the IEKF reports a degenerate update, so degenerate
-   geometry does not accumulate toward a reset. Report how often it did both.
+   in for the whole state when the IEKF reports a degenerate update, so
+   degenerate geometry does not accumulate toward a reset and no part of the
+   rejected solve survives it. Report how often it did both. The same prior
+   lifts motion_init's degeneracy veto, but only while its local-BA factor is
+   installed: seeding a solve does not change the rank of its normal equations,
+   so covering the window in time is not the same as constraining it.
 12. Replace fractional POSIX sleep calls, which truncate to zero and busy-spin,
    with explicit chrono durations, and take them only on iterations that found
    no work, so consuming a keyframe no longer costs a poll interval. These waits
    throttle only genuinely idle online workers; offline synchronization still
    depends solely on published queue/processing/drained state.
+
+13. Give the keyframe gate a dwell-time release, so a platform that stands still
+   long enough is still described. Upstream releases a keyframe only on
+   displacement, which leaves a long stationary start with no descriptor at all
+   and makes the start-to-end closure -- the only one that observes the whole
+   accumulated drift -- undetectable. Off by default.
+
+14. Report out of the odometry IEKF the two things it already computes and
+   discards -- the full `nnt` eigenvalue triple and the match count -- and take
+   the per-sweep disagreement between the odometry prior's prediction and what
+   registration made of it. Purely diagnostic: the triple is the only window
+   into why upstream's `eigenvalues[0] < 14` verdict fired, which is what drives
+   the degenerate fallback and the resets, and the disagreement is the only
+   measure of what registration adds over the prior that survives that fallback.
+   Nothing in the estimator reads either back.
+
+15. Summarize the IMU-propagated prediction covariance per sweep before the
+   prior's pose block replaces it and its cross terms are cleared, since neither
+   is recoverable afterwards. Also diagnostic, and also read by nothing: it says
+   whether the constant the prior's sigma is tuned to stands in for something
+   that actually moves, and how much information the substitution discards.
 
 Hunks are generated with `diff -U3` and applied with `patch -F0 -p0`; missing
 context is therefore rejected as upstream drift rather than accepted with fuzz.
@@ -97,22 +122,32 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      g0 = rot * g0;
  
      Eigen::Vector3d p0 = xs[0].p;
-@@ -656,6 +659,14 @@
+@@ -656,6 +659,24 @@
          Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
          eigvalue = saes.eigenvalues();
          is_degrade = eigvalue[0] < 15 ? true : false;
 +        // voxelslam_bridge: this veto exists because a window whose plane normals
 +        // span too little cannot be resolved from LiDAR geometry alone, and a
-+        // vetoed window resets the system and retries. An odometry prior covering
-+        // the window resolves it from outside, so the veto is not needed there.
++        // vetoed window resets the system and retries. An odometry prior can
++        // resolve it from outside -- but only while it is actually constraining
++        // this optimization, and covering the window in time is not the same
++        // thing as constraining it. `apply_prior_delta` only seeds the poses
++        // upstream of here, and seeding moves where the solve starts, not the
++        // rank of its normal equations; the loop above then optimizes the window
++        // and walks away from the seed. The prior's relative-pose factor inside
++        // LI_BA_OptimizerGravity is what holds it, so the veto is lifted only
++        // when that factor is installed as well as spanning the window.
 +        // Scope: only the degeneracy clause. The gravity-magnitude check below is
 +        // an independent sanity test on the IMU and still applies.
-+        if(is_degrade && voxelslam_offline::prior_covers(x_buf.front().t, x_buf.back().t))
++        double prior_ba_rot = 0.0, prior_ba_pos = 0.0;
++        if(is_degrade &&
++           voxelslam_offline::prior_ba_sigma(&prior_ba_rot, &prior_ba_pos) &&
++           voxelslam_offline::prior_covers(x_buf.front().t, x_buf.back().t))
 +          is_degrade = false;
  
          converge_thre = 0.01;
          if(converge_flag == 0)
-@@ -734,26 +745,40 @@
+@@ -734,26 +755,40 @@
    mutex mtx_loop;
    deque<ScanPose*> buf_lba2loop, buf_lba2loop_tem;
    vector<Keyframe*> *keyframes;
@@ -159,7 +194,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
    vector<string> sessionNames;
    string bagname, savepath;
-@@ -778,11 +803,14 @@
+@@ -778,11 +813,14 @@
      n.param<vector<double>>("General/extrinsic_rota", vecR, vector<double>());
      n.param<int>("General/is_save_map", is_save_map, 0);
  
@@ -174,7 +209,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      odom_ekf.imu_topic = imu_topic;
  
      n.param<double>("Odometry/cov_gyr", cov_gyr, 0.1);
-@@ -832,20 +860,22 @@
+@@ -832,20 +870,22 @@
      rand_walk_gyr, rand_walk_gyr, rand_walk_gyr, 
      rand_walk_acc, rand_walk_acc, rand_walk_acc;
  
@@ -208,7 +243,24 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      }
  
      sws.resize(thread_num);
-@@ -883,7 +913,10 @@
+@@ -853,7 +893,15 @@
+   }
+ 
+   // The point-to-plane alignment for odometry
+-  bool lio_state_estimation(PVecPtr pptr)
++  // voxelslam_bridge: the conditioning of the matched plane normals and how many
++  // points matched are reported out rather than only collapsed into the return
++  // value. Upstream computes both, decides `eigenvalues[0] < 14`, and discards
++  // them; taken scale-free the triple separates a verdict that fired on genuine
++  // rank deficiency from one that fired because almost nothing matched, and
++  // those two want different fixes.
++  bool lio_state_estimation(PVecPtr pptr,
++                            Eigen::Vector3d *nnt_eigenvalues = nullptr,
++                            int *nnt_match_count = nullptr)
+   {
+     IMUST x_prop = x_curr;
+ 
+@@ -883,7 +931,10 @@
        {
          pointVar &pv = pptr->at(i);
          Eigen::Matrix3d phat = hat(pv.pnt);
@@ -220,7 +272,18 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
  
          double sigma_d = 0;
-@@ -1196,35 +1229,56 @@
+@@ -951,6 +1002,10 @@
+     Eigen::Vector3d evalue = saes.eigenvalues();
+     // printf("eva %d: %lf\n", match_num, evalue[0]);
+ 
++    // voxelslam_bridge: hand the caller the full triple and the match count.
++    if(nnt_eigenvalues != nullptr) *nnt_eigenvalues = evalue;
++    if(nnt_match_count != nullptr) *nnt_match_count = match_num;
++
+     if(evalue[0] < 14)
+       return false;
+     else
+@@ -1196,35 +1251,56 @@
      ap_curr.z = x_curr.p[2];
      vector<int> vec_idx;
      vector<float> vec_dis;
@@ -302,7 +365,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
    }
  
    int initialization(deque<sensor_msgs::Imu::Ptr> &imus, Eigen::MatrixXd &hess, LidarFactor &voxhess, PLV(3) &pwld, pcl::PointCloud<PointType>::Ptr pcl_curr)
-@@ -1234,17 +1288,35 @@
+@@ -1234,17 +1310,35 @@
      static vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
  
      pcl::PointCloud<PointType>::Ptr orig(new pcl::PointCloud<PointType>(*pcl_curr));
@@ -338,7 +401,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
      pwld.clear();
      pvec_update(pptr, x_curr, pwld);
-@@ -1302,7 +1374,8 @@
+@@ -1302,7 +1396,8 @@
      odom_ekf.mean_acc.setZero();
      odom_ekf.init_num = 0;
      odom_ekf.IMU_init(imus);
@@ -348,7 +411,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
      for(int i=0; i<imu_pre_buf.size(); i++)
        delete imu_pre_buf[i];
-@@ -1480,7 +1553,10 @@
+@@ -1480,7 +1575,10 @@
          loop_update(); last_pos = x_curr.p; jour = 0;
        }
        
@@ -360,7 +423,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        if(is_finish)
        {
          break;
-@@ -1500,31 +1576,11 @@
+@@ -1500,31 +1598,11 @@
            }
            malloc_trim(0);
          }
@@ -397,7 +460,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          else if(sws[0].size() > 10000)
          {
            for(int i=0; i<500; i++)
-@@ -1535,11 +1591,13 @@
+@@ -1535,11 +1613,13 @@
            malloc_trim(0);
          }
  
@@ -413,7 +476,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        if (first_flag)
        {
          pcl::PointCloud<PointType> pl;
-@@ -1558,18 +1616,34 @@
+@@ -1558,18 +1638,43 @@
          if(init == 1)
          {
            motion_init_flag = 0;
@@ -445,13 +508,23 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
 +          voxelslam_offline::record_lidar_processed(current_lidar_ticket, false);
            continue;
 +        }
++
++        // voxelslam_bridge: the IMU-propagated prediction covariance, summarized
++        // here because apply_prior_delta overwrites its pose block below and
++        // clears the cross terms, after which neither is recoverable. Diagnostic
++        // only; nothing reads it back. It says whether the constant the prior's
++        // sigma is tuned to actually stands in for something that moves, and how
++        // much the substitution discards.
++        const voxelslam_offline::PropagatedCovariance propagated_cov =
++            voxelslam_offline::summarize_propagated_covariance(x_curr.cov);
  
          pcl::PointCloud<PointType> pl_down = *pcl_curr;
          down_sampling_voxel(pl_down, down_size);
-@@ -1583,13 +1657,40 @@
+@@ -1583,13 +1688,66 @@
          PVecPtr pptr(new PVec);
          var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
  
+-        if(lio_state_estimation(pptr))
 +        // voxelslam_bridge: an installed odometry prior replaces IMU dead reckoning
 +        // as this sweep's prediction, but does not replace registration: the pose
 +        // used for map insertion below must still be snapped to the map, or the
@@ -459,12 +532,33 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
 +        // The prior is applied as a delta from the last accepted state, never as an
 +        // absolute pose -- its world frame is anchored by its own initialization and
 +        // is not upstream's. lio_state_estimation then takes the warm-started pose
-+        // as its prior mean, exactly as it took the IMU-propagated one, and
-+        // x_curr.cov is left propagating so that weighting keeps its usual meaning.
++        // as its prior mean, exactly as it took the IMU-propagated one, weighted by
++        // x_curr.cov -- whose pose block apply_prior_delta replaces with the prior's
++        // own accuracy when one is configured.
 +        const bool primed = voxelslam_offline::apply_prior_delta(
 +            x_curr, x_prior_ref, x_prior_ref.t, x_curr.t);
 +
-         if(lio_state_estimation(pptr))
++        // voxelslam_bridge: the pose the prior predicted, kept so the sweep's
++        // evidence can be taken below. Registration overwrites x_curr, and the
++        // degenerate branch overwrites it a second time, so the comparison has
++        // to be captured here.
++        IMUST x_prior_pred = x_curr;
++        Eigen::Vector3d nnt_evalue = Eigen::Vector3d::Zero();
++        int nnt_match_num = 0;
++        const bool registered = lio_state_estimation(pptr, &nnt_evalue, &nnt_match_num);
++
++        // voxelslam_bridge: record this sweep -- how well the plane normals
++        // spanned the space, and how far registration moved the prior's
++        // prediction. Taken before the degenerate fallback below replaces x_curr
++        // with the prediction itself, which would otherwise read as perfect
++        // agreement on exactly the sweeps where the LiDAR had nothing to say, so
++        // it is not recoverable afterwards by differencing trajectories. This is
++        // the odometry thread and sweeps arrive in order.
++        voxelslam_offline::record_prior_sweep(
++            x_prior_pred, x_curr, nnt_evalue, nnt_match_num, primed, !registered,
++            propagated_cov);
++
++        if(registered)
          {
 +          if(primed) voxelslam_offline::record_prior_applied(false);
            if(degrade_cnt > 0) degrade_cnt--;
@@ -473,11 +567,16 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
 +        {
 +          voxelslam_offline::record_prior_applied(true);
 +          // voxelslam_bridge: the plane normals are rank-deficient, so the update
-+          // just applied is unconstrained in at least one direction. Fall back to
-+          // the prior's motion, which carries through the degeneracy, and do not
-+          // count this sweep toward a reset.
-+          voxelslam_offline::apply_prior_delta(
-+              x_curr, x_prior_ref, x_prior_ref.t, x_curr.t);
++          // just applied is unconstrained in at least one direction. Discard the
++          // whole solve and stand on the prior's prediction, which carries through
++          // the degeneracy, and do not count this sweep toward a reset.
++          //
++          // The whole solve: `lio_state_estimation` runs `x_curr += solution` over
++          // the full state, so keeping its velocity and bias corrections while
++          // replacing only the pose would leave the state half-built out of an
++          // update this branch exists to reject. x_prior_pred is that prediction,
++          // captured above.
++          x_curr = x_prior_pred;
 +          degrade_cnt = 0;
 +        }
          else
@@ -489,7 +588,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          pwld.clear();
          pvec_update(pptr, x_curr, pwld);
          ResultOutput::instance().pub_localtraj(pwld, jour, x_curr, sessionNames.size()-1, pcl_path);
-@@ -1605,6 +1706,43 @@
+@@ -1605,6 +1763,43 @@
            imu_pre_buf[win_count-2]->push_imu(imus);
          }
          
@@ -533,7 +632,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          keyframe_loading(jour);
          voxhess.clear(); voxhess.win_size = win_size;
  
-@@ -1617,6 +1755,9 @@
+@@ -1617,6 +1812,9 @@
  
          if(degrade_cnt > degrade_bound)
          {
@@ -543,7 +642,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            degrade_cnt = 0;
            system_reset(imus);
  
-@@ -1630,6 +1771,8 @@
+@@ -1630,6 +1828,8 @@
            motion_init_flag = 1;
            history_kfsize = 0;
  
@@ -552,7 +651,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            continue;
          }
        }
-@@ -1711,6 +1854,9 @@
+@@ -1711,6 +1911,9 @@
  
          win_base += mgsize; win_count -= mgsize;
        }
@@ -562,7 +661,18 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        
        double t_end = ros::Time::now().toSec();
        double mem = get_memory();
-@@ -1830,8 +1976,15 @@
+@@ -1813,6 +2016,10 @@
+     double ratio_drift = 0.05;
+     int curr_halt = 10, prev_halt = 30;
+     int isHighFly = 0;
++    // voxelslam_bridge: dwell time after which a stationary platform still emits
++    // a keyframe. Non-positive keeps upstream's displacement-only rule.
++    double dwell_seconds = 0.0;
++    n.param<double>("Loop/dwell_seconds", dwell_seconds, 0.0);
+     n.param<double>("Loop/jud_default", jud_default, 0.45);
+     n.param<double>("Loop/icp_eigval", icp_eigval, 14);
+     n.param<double>("Loop/ratio_drift", ratio_drift, 0.05);
+@@ -1830,8 +2037,15 @@
      STDescManager *std_manager = new STDescManager(config_setting);
      sessionNames.push_back(bagname);
      std_managers.push_back(std_manager);
@@ -578,7 +688,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      juds.push_back(jud_default);
      vector<double> jours(std_managers.size(), 0);
  
-@@ -1855,15 +2008,25 @@
+@@ -1855,15 +2069,25 @@
      {
        if(reset_flag == 1)
        {
@@ -605,7 +715,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          bl_local.clear(); buf_base = 0; 
          std_manager->config_setting_.skip_near_num_ = -(std_manager->plane_cloud_vec_.size()+10);
-@@ -1875,8 +2038,13 @@
+@@ -1875,8 +2099,13 @@
          jours.push_back(0);
  
          bagname = sessionNames.back();
@@ -621,7 +731,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
          ResultOutput::instance().pub_globalmap(multimap_keyframes, ids, pub_pmap);
-@@ -1884,26 +2052,49 @@
+@@ -1884,26 +2113,49 @@
          initial.clear(); graph = gtsam::NonlinearFactorGraph();
          ids.clear(); ids.push_back(std_managers.size()-1); 
          stepsizes.clear(); stepsizes.push_back(0); stepsizes.push_back(0);
@@ -684,7 +794,30 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
        int cur_id = std_managers.size() - 1;
        scanPoses->push_back(bl_head);
-@@ -1974,6 +2165,12 @@
+@@ -1931,7 +2183,21 @@
+       if(bl_local.size() < win_size) continue;
+       double ang = Log(x_key.R.transpose() * xc.R).norm() * 57.3;
+       double len = (xc.p - x_key.p).norm();
+-      if(ang < 5 && len < 0.1 && buf_base > win_size)
++      // voxelslam_bridge: a platform that is not moving emits no keyframes at
++      // all -- this gate skips every window within 5 deg and 0.1 m of the last
++      // one. A UAS that hovers for four minutes before taking off therefore
++      // leaves its start location unrepresented, and when it returns a thousand
++      // seconds later there is nothing there for BTC to match against: the one
++      // loop closure that would tie the flight together cannot be detected, and
++      // the surviving closures are all short-baseline ones between adjacent
++      // survey rows, which say nothing about the accumulated drift.
++      //
++      // Releasing on dwell time as well as displacement gives a stationary start
++      // a descriptor. `jours` is deliberately not advanced by this path -- no
++      // distance was travelled, and `jour` is the denominator of the loop
++      // drift gate.
++      const bool dwelled = dwell_seconds > 0.0 && (xc.t - x_key.t) > dwell_seconds;
++      if(ang < 5 && len < 0.1 && buf_base > win_size && !dwelled)
+       {
+         bl_local.front()->pvec = nullptr;
+         bl_local.pop_front();
+@@ -1974,6 +2240,12 @@
        }
        mtx_keyframe.lock();
        keyframes->push_back(smp);
@@ -697,7 +830,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        mtx_keyframe.unlock();
  
        vector<STD> stds_vec;
-@@ -1990,12 +2187,16 @@
+@@ -1990,12 +2262,16 @@
  
          if(search_result.first >= 0)
          {
@@ -714,7 +847,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
            if(icp_normal(*(std_manager->plane_cloud_vec_.back()), *(std_managers[id]->plane_cloud_vec_[search_result.first]), loop_transform, icp_eigval))
            {
              int ord_bl = std_managers[id]->plane_cloud_vec_[search_result.first]->header.seq;
-@@ -2008,9 +2209,12 @@
+@@ -2008,9 +2284,12 @@
              if(id == cur_id)
              {
                double span = smp->jour - keyframes->at(search_result.first)->jour;
@@ -728,7 +861,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                {
                  isPush = true;
                  step = stepsizes.size() - 2;
-@@ -2041,7 +2245,10 @@
+@@ -2041,7 +2320,10 @@
                }
                else
                {
@@ -740,7 +873,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                  {
                    jours[id] = 1e-6; // set to 0
                    isPush = true;
-@@ -2059,6 +2266,8 @@
+@@ -2059,6 +2341,8 @@
              {
                match_num++;
                lp_edges.push(id, cur_id, ord_bl, buf_base-1, loop_transform.second, loop_transform.first, v6_init);
@@ -749,7 +882,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
                if(step > -1)
                {
                  int id1 = stepsizes[step] + ord_bl;
-@@ -2096,10 +2305,25 @@
+@@ -2096,10 +2380,25 @@
          for(int i=0; i<5; i++) isam.update();
          gtsam::Values results = isam.calculateEstimate();
          int resultsize = results.size();
@@ -775,7 +908,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          history_kfsize = 0;
          for(int ii=0; ii<idsize; ii++)
          {
-@@ -2110,15 +2334,16 @@
+@@ -2110,15 +2409,16 @@
              multimap_scanPoses[tip]->at(ord)->set_state(results.at(j).cast<gtsam::Pose3>());
            }
          }
@@ -794,7 +927,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
          initial.clear();
          for(int i=0; i<resultsize; i++)
            initial.insert(i, results.at(i).cast<gtsam::Pose3>());
-@@ -2165,7 +2390,10 @@
+@@ -2165,7 +2465,10 @@
            kd_keyframes.setInputCloud(pl_kdmap);
            history_kfsize = pl_kdmap->size();
          }
@@ -805,7 +938,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          vector<int> ids2 = ids; ids2.pop_back();
          ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids2);
-@@ -2183,15 +2411,19 @@
+@@ -2183,15 +2486,19 @@
  
      if(is_finish)
      {
@@ -833,7 +966,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        }
  
        if(multimap_keyframes.empty()) 
-@@ -2213,15 +2445,23 @@
+@@ -2213,15 +2520,23 @@
        FileReaderWriter::instance().pgo_edges_io(lp_edges, sessionNames, 1, savepath, bagname);
      }
  
@@ -865,7 +998,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      }
      
      malloc_trim(0);
-@@ -2230,9 +2470,20 @@
+@@ -2230,9 +2545,20 @@
    // The top down process of HBA
    void topDownProcess(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, vector<int> &ids, vector<int> &stepsizes)
    {
@@ -889,7 +1022,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
      pcl::PointCloud<PointType> pl0;
      pub_pl_func(pl0, pub_pmap);
-@@ -2242,7 +2493,11 @@
+@@ -2242,7 +2568,11 @@
      pub_pl_func(pl0, pub_scan);
  
      double t0 = ros::Time::now().toSec();
@@ -902,7 +1035,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      
      for(PGO_Edge &edge: gba_edges1.edges)
      {
-@@ -2300,6 +2555,8 @@
+@@ -2300,6 +2630,8 @@
      Eigen::Quaterniond qq(multimap_scanPoses[0]->at(0)->x.R);
  
      double t1 = ros::Time::now().toSec();
@@ -911,7 +1044,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      printf("GBA opt: %lfs\n", t1 - t0);
  
      for(int ii=0; ii<idsize; ii++)
-@@ -2310,6 +2567,8 @@
+@@ -2310,6 +2642,8 @@
      }
  
      ResultOutput::instance().pub_global_path(multimap_scanPoses, pub_prev_path, ids);
@@ -920,7 +1053,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      vector<int> ids2 = ids; ids2.pop_back();
      ResultOutput::instance().pub_globalmap(multimap_keyframes, ids2, pub_pmap);
      ids2.clear(); ids2.push_back(ids.back());
-@@ -2348,6 +2607,9 @@
+@@ -2348,6 +2682,9 @@
      }
      
      int wdsize = smps.size();
@@ -930,7 +1063,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
      Eigen::MatrixXd hess;
      vector<double> gba_eigen_value_array_orig = gba_eigen_value_array;
      double gba_min_eigen_value_orig = gba_min_eigen_value;
-@@ -2382,9 +2644,11 @@
+@@ -2382,9 +2719,11 @@
        opt_lsv.thd_num = thread_num;
        vector<double> resis;
        bool is_converge = opt_lsv.damping_iter(xs, voxhess, &hess, resis, up, is_display);
@@ -944,7 +1077,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        {
          converge_thre = 0.01;
          if(converge_flag == 0)
-@@ -2502,54 +2766,129 @@
+@@ -2502,54 +2841,129 @@
  
      while(n.ok())
      {
@@ -1108,7 +1241,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
        vector<int> mps{smp_mp};
        HBA_add_edge(xs, smp_local, gba_edges1, mps, 1, 2, gba_smp->plptr);
        gba_smp->id = smp_local[0]->id;
-@@ -2559,15 +2898,17 @@
+@@ -2559,15 +2973,17 @@
        if(total_ba == 1)
        {
          printf("GBAsize: %d\n", gba_size);
@@ -1133,7 +1266,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
  
          if(is_finish)
          {
-@@ -2577,9 +2918,20 @@
+@@ -2577,9 +2993,20 @@
          gba_submaps.clear();
  
          malloc_trim(0);

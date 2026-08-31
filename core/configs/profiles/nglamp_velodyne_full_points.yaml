@@ -1,6 +1,8 @@
 # Same canonical profile as nglamp_velodyne.yaml, but feeds every point through
 # Voxel-SLAM. This is useful for high-density internal-deskew map inspection and
 # can change trajectory behavior relative to the default point_filter_num=3 run.
+# Emitting the deskewed scans is a runner decision, not a config one: pass
+# --dense-ply (the default) so the run writes map.ply.
 
 General:
   blind: 2.8
@@ -46,8 +48,3 @@ GBA:
   min_eigen_value: 0.01
   eigen_value_array: [9.0, 9.0, 9.0, 9.0]
   total_max_iter: 3
-
-Runtime:
-  emit_deskewed_points: true
-  enable_loop_closure: true
-  enable_global_mapping: true

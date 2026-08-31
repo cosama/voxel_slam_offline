@@ -23,11 +23,6 @@ from voxelslam import (
 
 
 PROGRESS_INTERVAL = 100
-IMU_TIME_EPSILON_SECONDS = 1e-6
-REQUIRED_TRAILING_IMU_SECONDS = 0.005
-# Offline replay is back-pressured, not wall-clock limited. A slow worker must
-# not turn a valid input into a partial run.
-PROCESSING_TIMEOUT_SECONDS = -1.0
 TRAJECTORY_FRAME_ID = "map"
 TRAJECTORY_CHILD_FRAME_ID = "base_link"
 
@@ -42,6 +37,11 @@ class RunnerConfig:
     stamp_is_end: bool = False
     dense_ply: bool = False
     dense_memory_limit_gb: float = 4.0
+    # Execution policy, not upstream configuration: upstream always starts both
+    # optional threads. Disabling them gives an odometry-only ablation; loop
+    # closure requires global mapping.
+    enable_loop_closure: bool = True
+    enable_global_mapping: bool = True
 
 
 @dataclass(slots=True)
@@ -81,7 +81,6 @@ def load_config(path: Path) -> tuple[VoxelSlamConfig, RunnerConfig]:
     runner_config = RunnerConfig(
         **{key: payload[key] for key in payload if key in runner_fields}
     )
-    slam_config.emit_deskewed_points = runner_config.dense_ply
     return slam_config, runner_config
 
 
@@ -98,6 +97,10 @@ def run_bag(
     slam = VoxelSlam(
         slam_config,
         lidar_to_imu=lidar_to_imu,
+        # The dense-map tap is on exactly when this run writes map.ply.
+        emit_deskewed_points=runner_config.dense_ply,
+        enable_loop_closure=runner_config.enable_loop_closure,
+        enable_global_mapping=runner_config.enable_global_mapping,
     )
 
     pointcloud_ply = output_dir / "map.ply" if runner_config.dense_ply else None
@@ -111,8 +114,6 @@ def run_bag(
     )
     imu_count = 0
     lidar_count = 0
-    last_imu_stamp = None
-    pending_lidar = []
     start_time = time.monotonic()
 
     try:
@@ -129,16 +130,7 @@ def run_bag(
                         [msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z],
                         [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
                     )
-                    last_imu_stamp = stamp
                     imu_count += 1
-                    lidar_count += push_ready_lidar(
-                        slam,
-                        pending_lidar,
-                        dense_map,
-                        last_imu_stamp=last_imu_stamp,
-                        stamp_is_end=runner_config.stamp_is_end,
-                        scan_duration=runner_config.scan_duration,
-                    )
                 else:
                     stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
                     points, times, intensities = parse_pointcloud(
@@ -146,31 +138,34 @@ def run_bag(
                         stamp,
                         scan_duration=runner_config.scan_duration,
                     )
-                    pending_lidar.append((stamp, points, times, intensities))
-                    lidar_count += push_ready_lidar(
+                    if points.size == 0:
+                        continue
+                    lidar_count += push_sweep(
                         slam,
-                        pending_lidar,
                         dense_map,
-                        last_imu_stamp=last_imu_stamp,
+                        stamp,
+                        points,
+                        times,
+                        intensities,
                         stamp_is_end=runner_config.stamp_is_end,
                         scan_duration=runner_config.scan_duration,
                     )
                     report_progress(dense_map, imu_count, lidar_count, start_time)
 
-        lidar_count += push_ready_lidar(
-            slam,
-            pending_lidar,
-            dense_map,
-            last_imu_stamp=last_imu_stamp,
-            stamp_is_end=runner_config.stamp_is_end,
-            scan_duration=runner_config.scan_duration,
-            require_all=True,
-        )
-        # Whatever push_ready_lidar could not cover is still queued; record it
-        # so an incomplete tail is visible in the manifest rather than silent.
-        unprocessed_tail_sweeps = len(pending_lidar)
         result = slam.finish()
         pipeline_status = slam.status()
+        # Sweeps the estimator could never cover with the recorded data --
+        # typically the tail of a bag that ends without trailing IMU. A property
+        # of the recording, so it is reported, never fatal.
+        unprocessed_tail_sweeps = int(pipeline_status["lidar"]["uncovered"])
+        if unprocessed_tail_sweeps:
+            print(
+                f"note: {unprocessed_tail_sweeps} lidar sweep(s) were never covered by "
+                "the recorded IMU stream (a recording ending without trailing IMU is "
+                "normal); they contribute no poses",
+                file=sys.stderr,
+                flush=True,
+            )
         if dense_map is not None:
             dense_map.drain_from(slam)
 
@@ -206,6 +201,11 @@ def run_bag(
         "dense_points": dense_map.points if dense_map is not None else 0,
         "metrics": result.metrics,
         "pipeline": pipeline_status,
+        "execution": {
+            "emit_deskewed_points": runner_config.dense_ply,
+            "enable_loop_closure": runner_config.enable_loop_closure,
+            "enable_global_mapping": runner_config.enable_global_mapping,
+        },
     }
     manifest = output_dir / "manifest.json"
     summary["manifest"] = str(manifest)
@@ -213,60 +213,41 @@ def run_bag(
     return summary
 
 
-def push_ready_lidar(
+def push_sweep(
     slam: VoxelSlam,
-    pending_lidar: list,
     dense_map: "DenseMapBuffer | None",
+    stamp: float,
+    points,
+    times,
+    intensities,
     *,
-    last_imu_stamp: float | None,
     stamp_is_end: bool,
     scan_duration: float,
-    require_all: bool = False,
 ) -> int:
-    pushed = 0
-    while pending_lidar:
-        stamp, points, times, intensities = pending_lidar[0]
-        if points.size == 0:
-            pending_lidar.pop(0)
-            continue
-        scan_end = stamp if stamp_is_end else stamp + scan_duration * 1.1
-        if (
-            last_imu_stamp is None
-            or last_imu_stamp
-            <= scan_end + REQUIRED_TRAILING_IMU_SECONDS + IMU_TIME_EPSILON_SECONDS
-        ):
-            if require_all:
-                # A bag whose tail lacks trailing IMU is a property of the
-                # recording, not an error we can replay our way out of. Raising
-                # here discarded the whole run's outputs after processing it in
-                # full; the sweeps stay in `pending_lidar` instead and the
-                # caller reports them.
-                print(
-                    "warning: final lidar messages have no trailing IMU coverage; "
-                    f"leaving {len(pending_lidar)} unprocessed "
-                    f"(last_imu={last_imu_stamp}, scan_end={scan_end}, "
-                    f"required={REQUIRED_TRAILING_IMU_SECONDS})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            break
-        pending_lidar.pop(0)
-        ticket = slam.push_lidar(
-            stamp,
-            points,
-            times,
-            intensities,
-            scan_duration=scan_duration,
-            stamp_is_end=stamp_is_end,
-        )
-        slam.synchronize(
-            ticket,
-            PROCESSING_TIMEOUT_SECONDS,
-        )
-        if dense_map is not None:
-            dense_map.drain_from(slam)
-        pushed += 1
-    return pushed
+    """Feed one sweep and let the estimator make whatever progress it can.
+
+    The runner does not inspect IMU coverage and does not decide which sweeps
+    are feedable: whether a sweep can be deskewed is the estimator's business,
+    and it reports the shortfall through `status()`. Feeding every sweep is what
+    keeps call order irrelevant here.
+    """
+
+    ticket = slam.push_lidar(
+        stamp,
+        points,
+        times,
+        intensities,
+        scan_duration=scan_duration,
+        stamp_is_end=stamp_is_end,
+    )
+    # Offline replay is back-pressured, not wall-clock limited: this blocks
+    # until the workers have made all the progress the data submitted so far
+    # allows, which is what makes the replay deterministic. It cannot be
+    # bounded or skipped.
+    slam.synchronize(ticket)
+    if dense_map is not None:
+        dense_map.drain_from(slam)
+    return 1
 
 
 def report_progress(

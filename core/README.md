@@ -40,14 +40,32 @@ slam.synchronize(ticket)
 result = slam.finish()
 ```
 
+An odometry prior is a causal input, not constructor-owned trajectory data:
+
+```python
+slam = voxelslam.VoxelSlam(config, lidar_to_imu=T_imu_lidar, enable_prior=True)
+slam.push_prior_pose(stamp, [x, y, z], [qx, qy, qz, qw], covariance_6x6)
+```
+
+Push through two samples strictly newer than each sweep end: the first brackets
+the pose and the second finalizes that bracket's central-difference velocity.
+The worker parks without extrapolating until that lookahead arrives. `finish()` closes the prior
+stream and lets uncovered edges fall back to upstream prediction.
+
 `finish()` is for shutdown. For online-style operation, read `latest_pose()`,
 `trajectory()`, `status()`, and `metrics()` while the instance remains active.
 
-Deterministic replay uses one producer and one live `VoxelSlam` instance. Feed
-enough IMU data to extend beyond a sweep, push that sweep, and call
-`synchronize(ticket)` before pushing the next one. Online callers may omit the
-barrier and retain upstream-style asynchronous queue processing. Multiple live
-instances and concurrent `push_*()`/`finish()` calls are not supported.
+Deterministic replay uses one producer and one live `VoxelSlam` instance. Push
+a sweep, call `synchronize(ticket)`, and call `finish()` when the data runs
+out; the caller never pre-checks whether a sweep is coverable. The barrier
+blocks until the workers can make no further progress with what has been
+submitted -- the ticket completing with every worker drained, or full
+quiescence with the estimator parked on a sweep the submitted IMU or prior does
+not reach. It takes no timeout and has no bypass, so a replay does not change with
+machine speed. Sweeps that were never coverable (a recording that ends without
+trailing IMU) appear in `status()["lidar"]["uncovered"]`. Online callers may
+omit the call and retain upstream-style asynchronous queue processing. Multiple
+live instances and concurrent `push_*()`/`finish()` calls are not supported.
 
 ## Notes
 

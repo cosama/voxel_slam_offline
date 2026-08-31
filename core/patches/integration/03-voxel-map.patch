@@ -4,13 +4,28 @@ voxel_map.hpp -- voxel-map optimization and bookkeeping fixes.
 2. Guard LM gain and convergence ratios against zero denominators.
 3. Propagate an invalid optimizer-state index as an exception.
 4. Fix wrong-container end-iterator comparisons in both voxel-cutting paths.
+5. Give the externally supplied odometry prior a relative-pose factor in both
+   local-BA optimizers, so the window is not re-decided by IMU preintegration
+   alone. Inert unless a prior and a BA sigma are installed.
 
 Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
 delta is generated with `diff -U3` and applied with zero fuzz.
 
 --- src/voxel_map.hpp
 +++ src/voxel_map.hpp
-@@ -340,18 +340,17 @@
+@@ -11,6 +11,11 @@
+ #include <ros/ros.h>
+ #include <fstream>
+ 
++// voxelslam_bridge: the odometry prior's relative-motion accessors, used by the
++// local-BA prior factor below. Included here rather than relied on from the
++// translation unit's earlier includes so this header stays self-contained.
++#include <voxelslam/offline_bridge.hpp>
++
+ struct pointVar 
+ {
+   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+@@ -340,18 +345,17 @@
      // voxhess.evaluate_only_residual(x_stats, 0, voxhess.plvec_voxels.size(), residual1);
  
      // int thd_num = 2;
@@ -37,7 +52,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
      {
        if(i != 0) 
          mthreads[i]->join();
-@@ -412,10 +411,11 @@
+@@ -412,10 +416,11 @@
        residual2 = only_residual(x_stats_temp, voxhess);
  
        q = (residual1-residual2);
@@ -51,7 +66,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
        {
          x_stats = x_stats_temp;
          double one_three = 1.0 / 3;
-@@ -434,7 +434,8 @@
+@@ -434,7 +439,8 @@
          is_converge = false;
        }
  
@@ -61,7 +76,151 @@ delta is generated with `diff -U3` and applied with zero fuzz.
          break;
      }
      resis.push_back(residual2);
-@@ -1210,8 +1211,8 @@
+@@ -447,6 +453,100 @@
+ // double imu_coef = 1e-8;
+ #define DVEL 6
+ // The LiDAR-Inertial BA optimizer
++// voxelslam_bridge: relative-pose factor from the externally supplied odometry
++// prior, for both local-BA optimizers below.
++//
++// Upstream regularizes the window with IMU preintegration alone, so a prior that
++// only warm starts the IEKF is re-decided here by the very IMU the prior was
++// brought in to replace: the window is free to rotate away from the prior, and
++// measurably does. This factor states the prior's own between-sweep motion as a
++// measurement, so the prior constrains the pose everywhere the pose is decided.
++//
++// The residual compares body-frame relative motion on both sides -- the prior's
++// (dR, dp) against the window's own -- so the arbitrary world-frame offset
++// between the prior's gravity/yaw anchor and upstream's cancels, exactly as it
++// does in `apply_prior_delta`. Only the shared IMU body frame is assumed.
++//
++// Structure and sign conventions are `IMU_PRE::give_evaluate` with dtime, v and
++// g dropped, which is what a pure relative-pose factor reduces to; the states'
++// rotation is a right perturbation and their position a world offset, matching
++// `IMUST::operator+=`, and both optimizers lay a state's rotation at offset 0
++// and its position at offset 3 within its DIM-sized block, so the same
++// scattering works for either.
++//
++// Returns twice the cost, matching `give_evaluate`'s convention, so the caller
++// applies the same 0.5 factor it applies to the IMU term.
++inline double prior_ba_factor(vector<IMUST> &x_stats, int win_size,
++                              Eigen::MatrixXd *Hess, Eigen::VectorXd *JacT)
++{
++  double sigma_rot = 0.0, sigma_pos = 0.0;
++  if(!voxelslam_offline::prior_ba_sigma(&sigma_rot, &sigma_pos))
++    return 0.0;
++
++  const double w_rot = 1.0 / (sigma_rot * sigma_rot);
++  const double w_pos = 1.0 / (sigma_pos * sigma_pos);
++  double residual = 0.0;
++
++  // Every consecutive pair, deliberately. Spanning a longer baseline instead --
++  // tying only every third pose, or only the window's endpoints -- looks like it
++  // should constrain the same accumulated motion while leaving the poses between
++  // free to be refined, and it was tried. It destroys the run: on the easiest
++  // dataset it took the ATE from 0.015 m to 4.6 m and put 2013 of 2870 sweeps
++  // into degenerate fallback, and it got worse the longer the span. The reason
++  // is the insertion ordering: each window pose's scan is already cut into the
++  // voxel map at its IEKF pose, so moving the tied poses onto the prior while
++  // leaving the untied ones where the LiDAR put them makes the window internally
++  // inconsistent with the map it was cut into, and marginalization bakes that in
++  // every slide. The chain has to be unbroken.
++  for(int i=0; i+1<win_size; i++)
++  {
++    const int j = i + 1;
++    Eigen::Matrix3d dR; Eigen::Vector3d dp;
++    // A window pose outside the prior's span simply carries no factor, which
++    // degrades to upstream's behavior for that pair rather than failing.
++    if(!voxelslam_offline::prior_relative_motion(x_stats[i].t, x_stats[j].t, &dR, &dp))
++      continue;
++
++    IMUST &st1 = x_stats[i];
++    IMUST &st2 = x_stats[j];
++    Eigen::Matrix3d res_r = dR.transpose() * st1.R.transpose() * st2.R;
++    Eigen::Vector3d exp_t = st1.R.transpose() * (st2.p - st1.p);
++    Eigen::Vector3d res_t = exp_t - dp;
++
++    Eigen::Matrix<double, 6, 1> rr;
++    rr.head(3) = Log(res_r);
++    rr.tail(3) = res_t;
++    residual += w_rot * rr.head(3).squaredNorm() + w_pos * rr.tail(3).squaredNorm();
++
++    if(Hess == nullptr) continue;
++
++    Eigen::Matrix<double, 6, 12> joc; joc.setZero();
++    Eigen::Matrix3d JR_inv = jr_inv(res_r);
++    joc.block<3, 3>(0, 0) = -JR_inv * st2.R.transpose() * st1.R;
++    joc.block<3, 3>(0, 6) =  JR_inv;
++    joc.block<3, 3>(3, 0) =  hat(exp_t);
++    joc.block<3, 3>(3, 3) = -st1.R.transpose();
++    joc.block<3, 3>(3, 9) =  st1.R.transpose();
++
++    Eigen::Matrix<double, 6, 6> W; W.setZero();
++    W.block<3, 3>(0, 0) = w_rot * I33;
++    W.block<3, 3>(3, 3) = w_pos * I33;
++
++    Eigen::Matrix<double, 12, 12> jtj = joc.transpose() * W * joc;
++    Eigen::Matrix<double, 12, 1> gg = joc.transpose() * W * rr;
++
++    const int idx[2] = {i, j};
++    for(int a=0; a<2; a++)
++    {
++      JacT->block<6, 1>(idx[a]*DIM, 0) += gg.block<6, 1>(a*6, 0);
++      for(int b=0; b<2; b++)
++        Hess->block<6, 6>(idx[a]*DIM, idx[b]*DIM) += jtj.block<6, 6>(a*6, b*6);
++    }
++  }
++
++  return residual;
++}
++
+ class LI_BA_Optimizer
+ {
+ public:
+@@ -506,6 +606,10 @@
+     JacT *= imu_coef;
+     residual *= (imu_coef * 0.5);
+ 
++    // voxelslam_bridge: added after the imu_coef scaling so the prior factor
++    // carries its own weight rather than inheriting the IMU term's.
++    residual += 0.5 * prior_ba_factor(x_stats, win_size, &Hess, &JacT);
++
+     // printf("resi: %lf\n", residual);
+ 
+     for(int i=0; i<tthd_num; i++)
+@@ -544,6 +648,10 @@
+     for(int i=0; i<win_size-1; i++)
+       residual1 += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, false);
+     residual1 *= (imu_coef * 0.5);
++    // voxelslam_bridge: the LM gain test compares this against divide_thread's
++    // residual, so the prior term has to appear in both or the step is rejected
++    // on a cost the Hessian did not model.
++    residual1 += 0.5 * prior_ba_factor(x_stats, win_size, nullptr, nullptr);
+ 
+     for(int i=0; i<thd_num; i++)
+     {
+@@ -719,6 +827,10 @@
+     JacT *= imu_coef;
+     residual *= (imu_coef * 0.5);
+ 
++    // voxelslam_bridge: added after the imu_coef scaling so the prior factor
++    // carries its own weight rather than inheriting the IMU term's.
++    residual += 0.5 * prior_ba_factor(x_stats, win_size, &Hess, &JacT);
++
+     // printf("resi: %lf\n", residual);
+ 
+     for(int i=0; i<tthd_num; i++)
+@@ -757,6 +869,9 @@
+     for(int i=0; i<win_size-1; i++)
+       residual1 += imus_factor[i]->give_evaluate_g(x_stats[i], x_stats[i+1], jtj, gg, false);
+     residual1 *= (imu_coef * 0.5);
++    // voxelslam_bridge: see LI_BA_Optimizer::only_residual -- both halves of the
++    // LM gain test must model the same cost.
++    residual1 += 0.5 * prior_ba_factor(x_stats, win_size, nullptr, nullptr);
+ 
+     for(int i=0; i<thd_num; i++)
+     {
+@@ -1210,8 +1325,8 @@
  
        if(opt_state >= int(vox_opt.pcr_adds.size()))
        {
@@ -72,7 +231,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
        }
  
        if(opt_state >= 0)
-@@ -1521,7 +1522,8 @@
+@@ -1521,7 +1636,8 @@
      {
        iter->second->allocate(win_count, pv, pw, sws);
        iter->second->isexist = true;
@@ -82,7 +241,7 @@ delta is generated with `diff -U3` and applied with zero fuzz.
          feat_tem_map[position] = iter->second;
      }
      else
-@@ -1562,7 +1564,8 @@
+@@ -1562,7 +1678,8 @@
      if(iter != feat_map.end())
      {
        iter->second->isexist = true;
@@ -92,4 +251,3 @@ delta is generated with `diff -U3` and applied with zero fuzz.
          feat_tem_map[position] = iter->second;
        ot = iter->second;
      }
-

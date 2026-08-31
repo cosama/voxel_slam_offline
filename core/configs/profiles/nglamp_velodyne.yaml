@@ -1,6 +1,9 @@
-# Algorithm/runtime profile for the canonical nglamp Velodyne benchmark.
-# Frame calibration is intentionally not stored here. Parse URDF/TF outside
-# voxelslam and pass the numeric extrinsic to VoxelSlam(..., lidar_to_imu=...).
+# Algorithm profile for the canonical nglamp Velodyne benchmark: upstream
+# parameters only.  Frame calibration is intentionally not stored here, and
+# neither is execution policy. Parse URDF/TF outside voxelslam and pass the
+# numeric extrinsic to VoxelSlam(..., lidar_to_imu=...); pass the deskewed-scan
+# tap and the optional threads as VoxelSlam(..., emit_deskewed_points=...,
+# enable_loop_closure=..., enable_global_mapping=...).
 
 General:
   blind: 2.8
@@ -46,7 +49,3 @@ GBA:
   min_eigen_value: 0.01
   eigen_value_array: [9.0, 9.0, 9.0, 9.0]
   total_max_iter: 3
-
-Runtime:
-  enable_loop_closure: true
-  enable_global_mapping: true
