@@ -52,29 +52,11 @@ struct ScalarStats {
 
 struct Metrics {
   std::uint64_t odometry_degrade_resets = 0;
-  // How much of the run the odometry prior actually decided. `applied` counts
-  // sweeps it predicted; `fallback` counts the subset where the IEKF reported a
-  // degenerate update and the prior's pose stood unregistered. A high fallback
-  // share is the signature of a run the prior carried rather than one the map
-  // constrained.
   std::uint64_t odometry_prior_applied = 0;
   std::uint64_t odometry_prior_fallback = 0;
-  // The odometry IEKF's own conditioning and its disagreement with the prior,
-  // aggregated. The full per-sweep rows are in the run's prior_trace; these are
-  // here so a manifest carries the shape of the run without it.
   ScalarStats iekf_eigenvalue_min;
   ScalarStats iekf_eigenvalue_ratio;
   ScalarStats iekf_match_count;
-  ScalarStats prior_disagreement_rot;
-  ScalarStats prior_disagreement_pos;
-  // The IMU-propagated prediction covariance the prior's pose block replaces,
-  // and how strongly that pose block was correlated with velocity and the
-  // biases before the substitution cleared those cross terms. See
-  // voxelslam_offline::PropagatedCovariance for why both are worth knowing.
-  ScalarStats propagated_sigma_rot;
-  ScalarStats propagated_sigma_pos;
-  ScalarStats propagated_pose_velocity_correlation;
-  ScalarStats propagated_pose_bias_correlation;
 
   std::uint64_t loop_candidates = 0;
   std::uint64_t loop_score_passed = 0;
@@ -104,21 +86,14 @@ struct Metrics {
 };
 
 struct PipelineStatus {
-  std::uint64_t latest_imu_ticket = 0;
-  std::uint64_t latest_prior_ticket = 0;
-  std::uint64_t latest_lidar_ticket = 0;
   std::uint64_t latest_lidar_processed_ticket = 0;
   std::uint64_t lidar_completed = 0;
   std::uint64_t lidar_completed_with_pose = 0;
   std::uint64_t lidar_completed_without_pose = 0;
   bool odometry_waiting_for_imu = false;
   std::uint64_t odometry_waiting_lidar_ticket = 0;
-  // End time of the parked sweep, so the host can re-test the wait predicate
-  // against the IMU it has actually submitted. See blocked_on_unsubmitted_imu().
   double odometry_waiting_scan_end_time = 0.0;
   bool odometry_waiting_for_prior = false;
-  // Both bounds, so the host can re-run prior_ready_for_sweep() rather than
-  // keep a second copy of the rule. See blocked_on_unsubmitted_prior().
   double odometry_waiting_prior_begin_time = 0.0;
   double odometry_waiting_prior_end_time = 0.0;
   bool odometry_thread_finished = false;
@@ -136,6 +111,7 @@ struct Recorder {
   Metrics metrics;
   PipelineStatus pipeline;
   bool emit_deskewed_points = false;
+  bool retain_prior_sweeps = false;
 };
 
 Recorder& recorder() {
@@ -143,7 +119,7 @@ Recorder& recorder() {
   return instance;
 }
 
-void reset_records(bool emit_deskewed_points) {
+void reset_records(bool emit_deskewed_points, bool retain_prior_sweeps) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   std::vector<PoseRecord>().swap(rec.poses);
@@ -154,24 +130,13 @@ void reset_records(bool emit_deskewed_points) {
   rec.metrics = Metrics();
   rec.pipeline = PipelineStatus();
   rec.emit_deskewed_points = emit_deskewed_points;
+  rec.retain_prior_sweeps = retain_prior_sweeps;
 }
 
 bool is_emitting_deskewed_points() {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
   return rec.emit_deskewed_points;
-}
-
-void record_imu_pushed(std::uint64_t ticket) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_imu_ticket = std::max(rec.pipeline.latest_imu_ticket, ticket);
-}
-
-void record_lidar_pushed(std::uint64_t ticket) {
-  auto& rec = recorder();
-  std::lock_guard<std::mutex> lock(rec.mutex);
-  rec.pipeline.latest_lidar_ticket = std::max(rec.pipeline.latest_lidar_ticket, ticket);
 }
 
 void record_lidar_processed(std::uint64_t ticket, bool pose_recorded) {
@@ -189,8 +154,6 @@ void record_lidar_processed(std::uint64_t ticket, bool pose_recorded) {
 void record_odometry_waiting_for_imu(std::uint64_t ticket, bool waiting, double scan_end_time) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  // Published as one unit under the recorder mutex: a reader that sees the
-  // waiting flag set always sees the end time that goes with it.
   rec.pipeline.odometry_waiting_for_imu = waiting;
   rec.pipeline.odometry_waiting_lidar_ticket = ticket;
   rec.pipeline.odometry_waiting_scan_end_time = scan_end_time;
@@ -408,9 +371,6 @@ PipelineStatus snapshot_pipeline_status() {
 }
 
 
-// ---------------------------------------------------------------------------
-// Externally supplied odometry prior
-// ---------------------------------------------------------------------------
 
 struct PriorTrajectory {
   std::mutex mutex;
@@ -431,18 +391,6 @@ PriorTrajectory& prior_trajectory() {
   return instance;
 }
 
-// The prior carries pose only, but upstream's state needs a velocity for IMU
-// preintegration and deskew. Central difference at interior samples, one-sided
-// at the buffer's two ends.
-//
-// Derived on demand rather than maintained in a parallel array: there is then
-// no incremental update to keep in step with retention, and no sample whose
-// value depends on how the producer batched its pushes. What makes a consumed
-// velocity final is that the sample is interior, and that is exactly what
-// `prior_ready_for_sweep()` waits for; after `close_prior()` the tail's
-// one-sided difference is final too, because no further sample can arrive.
-//
-// Callers must hold `prior.mutex`.
 Eigen::Vector3d prior_velocity_at(const PriorTrajectory& prior, std::size_t index) {
   const std::size_t count = prior.stamps.size();
   if (count < 2) {
@@ -517,45 +465,25 @@ void record_prior_sweep_values(double stamp,
                                const Eigen::Vector3d& nnt_eigenvalues,
                                int match_count,
                                bool prior_primed,
-                               bool degenerate,
-                               double disagreement_rot,
-                               double disagreement_pos,
-                               const PropagatedCovariance& propagated) {
+                               bool degenerate) {
   auto& rec = recorder();
   std::lock_guard<std::mutex> lock(rec.mutex);
-  PriorSweepRecord row;
-  row.stamp = stamp;
-  row.eigenvalue_min = nnt_eigenvalues[0];
-  row.eigenvalue_mid = nnt_eigenvalues[1];
-  row.eigenvalue_max = nnt_eigenvalues[2];
-  row.match_count = match_count;
-  row.prior_primed = prior_primed;
-  row.degenerate = degenerate;
-  row.disagreement_rot = disagreement_rot;
-  row.disagreement_pos = disagreement_pos;
-  row.propagated_sigma_rot = propagated.sigma_rot_rad;
-  row.propagated_sigma_pos = propagated.sigma_pos_m;
-  row.propagated_pose_velocity_correlation = propagated.max_pose_velocity_correlation;
-  row.propagated_pose_bias_correlation = propagated.max_pose_bias_correlation;
-  rec.prior_sweeps.push_back(row);
-
   auto& d = rec.metrics;
   d.iekf_eigenvalue_min.observe(nnt_eigenvalues[0]);
   d.iekf_eigenvalue_ratio.observe(nnt_eigenvalues[2] > 0.0
                                       ? nnt_eigenvalues[0] / nnt_eigenvalues[2]
                                       : 0.0);
   d.iekf_match_count.observe(match_count);
-  if (prior_primed) {
-    d.prior_disagreement_rot.observe(disagreement_rot);
-    d.prior_disagreement_pos.observe(disagreement_pos);
-  }
-  if (propagated.sigma_pos_m > 0.0) {
-    d.propagated_sigma_rot.observe(propagated.sigma_rot_rad);
-    d.propagated_sigma_pos.observe(propagated.sigma_pos_m);
-    d.propagated_pose_velocity_correlation.observe(
-        propagated.max_pose_velocity_correlation);
-    d.propagated_pose_bias_correlation.observe(
-        propagated.max_pose_bias_correlation);
+  if (rec.retain_prior_sweeps) {
+    rec.prior_sweeps.push_back({
+        stamp,
+        nnt_eigenvalues[0],
+        nnt_eigenvalues[1],
+        nnt_eigenvalues[2],
+        match_count,
+        prior_primed,
+        degenerate,
+    });
   }
 }
 
@@ -565,10 +493,6 @@ std::vector<PriorSweepRecord> prior_sweep_trace() {
   return rec.prior_sweeps;
 }
 
-// Interpolate within a sweep's copied window. The same linear/slerp pair
-// `prior_pose_at` uses, over the same bracket; `stamp` is clamped because the
-// frame is built to span the sweep and a point outside it is a rounding edge,
-// not a query the caller can do anything with.
 void interpolate_deskew_frame(const PriorDeskewFrame& frame,
                               double stamp,
                               Eigen::Vector3d* position,
@@ -601,9 +525,6 @@ bool prior_deskew_frame(double stamp_begin,
   auto& prior = prior_trajectory();
   std::lock_guard<std::mutex> lock(prior.mutex);
   const std::size_t count = prior.stamps.size();
-  // All of the sweep or none of it: a point the prior cannot place must not be
-  // left at its raw coordinates beside points that were undistorted, because
-  // that asserts it was already at the sweep-end pose.
   if (count < 2 || !std::isfinite(stamp_begin) || !std::isfinite(stamp_reference) ||
       stamp_begin > stamp_reference || stamp_begin < prior.stamps.front() ||
       stamp_reference > prior.stamps.back()) {
@@ -715,7 +636,6 @@ std::uint64_t push_prior_pose(double stamp,
         Eigen::LLT<Eigen::Matrix<double, 6, 6>>(*covariance).info() != Eigen::Success) {
       throw std::invalid_argument("prior covariance must be finite, symmetric, and positive definite");
     }
-    // The check above already established that every earlier pose carried one.
     if (!first_covariance && !prior.covariance.isApprox(*covariance, 1e-12)) {
       throw std::invalid_argument(
           "prior covariance must stay fixed for a run; adaptive weighting is not supported");
@@ -734,12 +654,6 @@ std::uint64_t push_prior_pose(double stamp,
   prior.positions.push_back(position);
   prior.orientations.push_back(q);
 
-  // Trim ahead of the oldest sweep any live local-BA window can still
-  // reference, keeping two predecessors: one to bracket a query at
-  // `retain_from` itself, and one more so that bracket's own central-difference
-  // velocity is still computable. With both, retention cannot change the value
-  // of any query the estimator can still make. Never trim below the two samples
-  // an interpolation needs at all.
   if (std::isfinite(prior.retain_from) && prior.stamps.size() > 2) {
     const auto keep =
         std::lower_bound(prior.stamps.begin(), prior.stamps.end(), prior.retain_from);
@@ -753,13 +667,7 @@ std::uint64_t push_prior_pose(double stamp,
     }
   }
 
-  const std::uint64_t ticket = ++prior.latest_ticket;
-  {
-    auto& rec = recorder();
-    std::lock_guard<std::mutex> rec_lock(rec.mutex);
-    rec.pipeline.latest_prior_ticket = ticket;
-  }
-  return ticket;
+  return ++prior.latest_ticket;
 }
 
 void retain_prior_from(double stamp) {
@@ -780,6 +688,12 @@ std::size_t prior_buffer_size() {
   return prior.stamps.size();
 }
 
+std::uint64_t prior_latest_ticket() {
+  auto& prior = prior_trajectory();
+  std::lock_guard<std::mutex> lock(prior.mutex);
+  return prior.latest_ticket;
+}
+
 bool prior_ready_for_sweep(double stamp_begin, double stamp_end) {
   auto& prior = prior_trajectory();
   std::lock_guard<std::mutex> lock(prior.mutex);
@@ -792,19 +706,9 @@ bool prior_ready_for_sweep(double stamp_begin, double stamp_end) {
   if (prior.stamps.empty()) {
     return false;
   }
-  // A left-edge miss can never be repaired by a strictly ordered future push;
-  // let this sweep use upstream prediction. A right-edge miss is lookahead and
-  // must park rather than extrapolate.
   if (stamp_begin < prior.stamps.front()) {
     return true;
   }
-  // Pose interpolation needs the first sample after the sweep. Velocity at
-  // that right bracket needs one more sample so its central difference is
-  // final before the estimator consumes it. This makes results independent of
-  // how the producer batches pushes. close_prior() finalizes the tail with the
-  // same one-sided endpoint difference used by the former bulk API -- and a
-  // producer whose prior is shorter than the recording has to call it, or every
-  // remaining sweep parks here forever.
   const auto first_after =
       std::upper_bound(prior.stamps.begin(), prior.stamps.end(), stamp_end);
   return prior.stamps.end() - first_after >= 2;
@@ -813,8 +717,6 @@ bool prior_ready_for_sweep(double stamp_begin, double stamp_end) {
 bool prior_covers(double stamp_begin, double stamp_end) {
   auto& prior = prior_trajectory();
   std::lock_guard<std::mutex> lock(prior.mutex);
-  // Two samples, because covering a stamp means being able to interpolate it;
-  // this is the same guard prior_pose_at() applies.
   if (prior.stamps.size() < 2 || !std::isfinite(stamp_begin) || !std::isfinite(stamp_end)) {
     return false;
   }
@@ -831,8 +733,6 @@ bool prior_pose_at(double stamp,
   if (count == 0 || !std::isfinite(stamp)) {
     return false;
   }
-  // Outside the prior's span there is nothing to interpolate; the caller falls
-  // back to upstream rather than extrapolating.
   if (count < 2 || stamp < prior.stamps.front() || stamp > prior.stamps.back()) {
     return false;
   }
@@ -909,8 +809,6 @@ struct VoxelSlamOptions {
   int loop_acsize = 2;
   int loop_mgsize = 2;
   int loop_is_high_fly = 0;
-  double loop_dwell_seconds = 0.0;
-
   double gba_voxel_size = 2.0;
   double gba_min_eigen_value = 0.01;
   std::vector<double> gba_eigen_value_array = {9.0, 9.0, 9.0, 9.0};
@@ -920,17 +818,11 @@ struct VoxelSlamOptions {
   bool enable_loop_closure = true;
   bool enable_global_mapping = true;
 
-  // Opens the causal prior input. Data itself arrives through push_prior_pose,
-  // never through constructor options.
   bool enable_prior = false;
 
-  // The same accuracy, used as the weight of the prior's relative-pose factor
-  // in the local BA. Separate from the IEKF sigmas above because the two act on
-  // different estimators and are worth tuning apart.
   double prior_ba_sigma_rot = 0.0;
   double prior_ba_sigma_pos = 0.0;
 
-  // Undistort points against the prior instead of IMU dead reckoning.
   bool prior_deskew = false;
 
 };
@@ -959,14 +851,9 @@ static py::array_t<double> poses_to_array(const std::vector<voxelslam_offline::P
   return out;
 }
 
-// One row per sweep, in sweep order: the columns named by PRIOR_TRACE_COLUMNS
-// below. A plain array rather than a list of dicts because it is a few thousand
-// rows per run and the host writes it straight out as a CSV.
 static const char* const PRIOR_TRACE_COLUMNS[] = {
     "stamp", "eigen_min", "eigen_mid", "eigen_max", "match_count",
-    "prior_primed", "degenerate", "disagreement_rot", "disagreement_pos",
-    "propagated_sigma_rot", "propagated_sigma_pos",
-    "propagated_pose_velocity_correlation", "propagated_pose_bias_correlation",
+    "prior_primed", "degenerate",
 };
 
 static py::array_t<double> prior_trace_to_array(
@@ -984,12 +871,6 @@ static py::array_t<double> prior_trace_to_array(
     dst(i, 4) = static_cast<double>(r.match_count);
     dst(i, 5) = r.prior_primed ? 1.0 : 0.0;
     dst(i, 6) = r.degenerate ? 1.0 : 0.0;
-    dst(i, 7) = r.disagreement_rot;
-    dst(i, 8) = r.disagreement_pos;
-    dst(i, 9) = r.propagated_sigma_rot;
-    dst(i, 10) = r.propagated_sigma_pos;
-    dst(i, 11) = r.propagated_pose_velocity_correlation;
-    dst(i, 12) = r.propagated_pose_bias_correlation;
   }
   return out;
 }
@@ -1055,14 +936,6 @@ static py::dict metrics_to_dict(const voxelslam_offline::Metrics& d) {
   odometry["iekf_eigen_min"] = scalar_stats_to_dict(d.iekf_eigenvalue_min);
   odometry["iekf_eigen_ratio"] = scalar_stats_to_dict(d.iekf_eigenvalue_ratio);
   odometry["iekf_match_count"] = scalar_stats_to_dict(d.iekf_match_count);
-  odometry["prior_disagreement_rot"] = scalar_stats_to_dict(d.prior_disagreement_rot);
-  odometry["prior_disagreement_pos"] = scalar_stats_to_dict(d.prior_disagreement_pos);
-  odometry["propagated_sigma_rot"] = scalar_stats_to_dict(d.propagated_sigma_rot);
-  odometry["propagated_sigma_pos"] = scalar_stats_to_dict(d.propagated_sigma_pos);
-  odometry["propagated_pose_velocity_correlation"] =
-      scalar_stats_to_dict(d.propagated_pose_velocity_correlation);
-  odometry["propagated_pose_bias_correlation"] =
-      scalar_stats_to_dict(d.propagated_pose_bias_correlation);
   out["odometry"] = odometry;
 
   py::dict loop;
@@ -1112,6 +985,9 @@ static py::list events_to_list(const std::vector<voxelslam_offline::EventRecord>
 }
 
 static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
+                               std::uint64_t latest_imu_ticket,
+                               std::uint64_t latest_prior_ticket,
+                               std::uint64_t latest_lidar_ticket,
                                std::size_t pending_imu,
                                std::size_t buffered_prior,
                                std::size_t pending_lidar,
@@ -1125,29 +1001,25 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
   py::dict out;
 
   py::dict imu;
-  imu["latest_ticket"] = status.latest_imu_ticket;
+  imu["latest_ticket"] = latest_imu_ticket;
   imu["pending_queue"] = pending_imu;
   out["imu"] = imu;
 
   py::dict prior;
   prior["enabled"] = voxelslam_offline::prior_enabled();
-  prior["latest_ticket"] = status.latest_prior_ticket;
+  prior["latest_ticket"] = latest_prior_ticket;
   prior["buffered_poses"] = buffered_prior;
   out["prior"] = prior;
 
   py::dict lidar;
-  lidar["latest_ticket"] = status.latest_lidar_ticket;
+  lidar["latest_ticket"] = latest_lidar_ticket;
   lidar["latest_processed_ticket"] = status.latest_lidar_processed_ticket;
   lidar["completed"] = status.lidar_completed;
   lidar["completed_with_pose"] = status.lidar_completed_with_pose;
   lidar["completed_without_pose"] = status.lidar_completed_without_pose;
   lidar["pending_queue"] = pending_lidar;
-  // Sweeps accepted but never given a terminal accounting state: whatever the
-  // estimator could not cover with the data submitted. A recording whose tail
-  // has no trailing IMU always ends with a few; that is a property of the
-  // recording, so this is reported and never fatal.
-  lidar["uncovered"] = status.latest_lidar_ticket > status.lidar_completed
-                           ? status.latest_lidar_ticket - status.lidar_completed
+  lidar["uncovered"] = latest_lidar_ticket > status.lidar_completed
+                           ? latest_lidar_ticket - status.lidar_completed
                            : std::uint64_t{0};
   out["lidar"] = lidar;
 
@@ -1174,7 +1046,6 @@ static py::dict status_to_dict(const voxelslam_offline::PipelineStatus& status,
   workers["odometry_finished"] = status.odometry_thread_finished;
   workers["loop_finished"] = !loop_enabled || status.loop_thread_finished;
   workers["gba_finished"] = !gba_enabled || status.gba_thread_finished;
-  // Drained, not merely between passes -- see workers_idle().
   workers["gba_idle"] = !gba_enabled || gba_idle;
   out["workers"] = workers;
 
@@ -1189,7 +1060,8 @@ class VoxelSlam {
       std::filesystem::create_directories(options_.save_path);
     }
     reset_upstream_buffers();
-    voxelslam_offline::reset_records(options_.emit_deskewed_points);
+    voxelslam_offline::reset_records(options_.emit_deskewed_points,
+                                     options_.enable_prior);
     voxelslam_offline::reset_prior(options_.enable_prior);
     voxelslam_offline::set_prior_ba_sigma(options_.prior_ba_sigma_rot,
                                           options_.prior_ba_sigma_pos);
@@ -1210,11 +1082,6 @@ class VoxelSlam {
 
   ~VoxelSlam() {
     if (!finished_) {
-      // Teardown of a session the host abandoned -- an exception in its replay
-      // loop, or a dropped reference. Join the workers, but do not wait for
-      // pending work: its results are already unreachable, and the wait a
-      // completed run performs is unbounded by design, which a destructor
-      // cannot be. finish() is the only path that produces a result.
       try {
         join_workers();
         finished_ = true;
@@ -1246,7 +1113,6 @@ class VoxelSlam {
     msg->angular_velocity.z = angular_velocity[2];
 
     const std::uint64_t ticket = ++latest_imu_ticket_;
-    voxelslam_offline::record_imu_pushed(ticket);
     std::lock_guard<std::mutex> lock(mBuf);
     imu_last_time = stamp;
     imu_buf.push_back(msg);
@@ -1287,11 +1153,6 @@ class VoxelSlam {
         covariance_ptr);
   }
 
-  // Declare the prior stream complete without ending the run. Sweeps past the
-  // prior's last sample then fall back to upstream prediction immediately
-  // instead of parking for lookahead that cannot arrive -- which is what keeps
-  // synchronize() a real barrier, and the LiDAR queue bounded, for the rest of
-  // a run whose prior is shorter than its recording. Idempotent.
   void close_prior() {
     if (finished_) {
       return;
@@ -1349,10 +1210,7 @@ class VoxelSlam {
       }
     }
 
-    // Every valid submission receives a ticket and a terminal accounting state,
-    // even when upstream-compatible preprocessing removes every point.
     const std::uint64_t ticket = ++latest_lidar_ticket_;
-    voxelslam_offline::record_lidar_pushed(ticket);
 
     pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
     cloud->reserve(static_cast<std::size_t>(count));
@@ -1418,8 +1276,6 @@ class VoxelSlam {
       return result_;
     }
 
-    // End-of-stream makes an uncovered right edge definitive: parked sweeps
-    // can now fall back to upstream instead of waiting for impossible lookahead.
     voxelslam_offline::close_prior();
     std::exception_ptr finish_error;
     try {
@@ -1441,8 +1297,6 @@ class VoxelSlam {
     return result_;
   }
 
-  // Stop the workers and join them. Whatever they have already accepted is
-  // still finished; nothing new is admitted.
   void join_workers() {
     request_finish();
     if (has_thread_error()) {
@@ -1502,23 +1356,13 @@ class VoxelSlam {
   }
 
   std::uint64_t latest_prior_ticket() const {
-    return voxelslam_offline::snapshot_pipeline_status().latest_prior_ticket;
+    return voxelslam_offline::prior_latest_ticket();
   }
 
   std::uint64_t latest_lidar_ticket() const {
     return latest_lidar_ticket_;
   }
 
-  // The replay barrier. It blocks until the workers have made all the progress
-  // they can with the data submitted so far. That is either the target ticket
-  // completing, or full quiescence: every worker drained and the estimator
-  // parked on a sweep it cannot advance without input the host has not
-  // submitted. There is no deadline; a deadline would make the barrier -- and
-  // with it determinism -- optional, and would turn a slow machine into a
-  // different trajectory. The quiescent exit is not a deadline and not
-  // optional: it is a property of the submitted data, so it holds at every
-  // instant after it first holds, and the host cannot reach it early by
-  // running fast.
   void wait_for_processed(std::uint64_t ticket = 0) const {
     throw_if_thread_error();
     const std::uint64_t target = ticket == 0 ? latest_lidar_ticket_ : ticket;
@@ -1531,11 +1375,6 @@ class VoxelSlam {
       if (status.latest_lidar_processed_ticket >= target && workers_idle()) {
         return;
       }
-      // Order matters and must not be rearranged: a parked estimator is what
-      // guarantees no further work can be queued for the loop and global-
-      // mapping threads, so their drained state is only meaningful once read
-      // after the park has been established. workers_idle() therefore comes
-      // second, exactly as it does above.
       if (blocked_on_unsubmitted_imu(status, target) && workers_idle()) {
         return;
       }
@@ -1599,8 +1438,6 @@ class VoxelSlam {
     }
     if (slam_) {
       slam_->is_finish = true;
-      // Wake a loop thread waiting for final GBA without letting it consume a
-      // partial result from a worker that failed.
       slam_->gba_cancelled = true;
       slam_->gba_flag = false;
     }
@@ -1624,23 +1461,6 @@ class VoxelSlam {
     }
   }
 
-  // True when the estimator has parked a sweep at or before `target` because the
-  // IMU submitted so far does not extend past that sweep's end, so no amount of
-  // waiting can advance it.
-  //
-  // The predicate is re-evaluated here against the IMU horizon as it stands
-  // now, not against the worker's opinion at the moment it published the park.
-  // That is what makes a stale park record harmless: to leave a parked sweep
-  // the worker needs `imu_last_time` strictly past that sweep's end time, and
-  // `imu_last_time` never decreases, so any park the worker has already left
-  // reads as unblocked here. The converse -- reporting blocked while the worker
-  // is mid-sweep -- cannot happen either, because the flag is cleared in the
-  // same call that lets the sweep through, before any estimator work runs.
-  //
-  // The host is the only producer of IMU and it is inside this call, so the
-  // horizon cannot move while the barrier is deciding. The result is a function
-  // of the submitted data alone; thread timing cannot change it, only how long
-  // the loop spins before observing it.
   bool blocked_on_unsubmitted_imu(const voxelslam_offline::PipelineStatus& status,
                                   std::uint64_t target) const {
     if (!status.odometry_waiting_for_imu ||
@@ -1648,8 +1468,6 @@ class VoxelSlam {
         status.odometry_waiting_lidar_ticket > target) {
       return false;
     }
-    // Sweeps leave the queue in order, so a sweep parked at or before `target`
-    // blocks `target` itself and everything queued behind it.
     double submitted_imu_end = 0.0;
     {
       std::lock_guard<std::mutex> lock(mBuf);
@@ -1658,11 +1476,6 @@ class VoxelSlam {
     return submitted_imu_end <= status.odometry_waiting_scan_end_time;
   }
 
-  // The prior's counterpart to blocked_on_unsubmitted_imu(), and it re-evaluates
-  // the worker's own predicate against the prior as it stands now rather than a
-  // second rule that happens to agree. A stale park is harmless for the same
-  // reason: the buffer only ever gains samples on the right, so a sweep the
-  // worker has already left reads as ready here.
   bool blocked_on_unsubmitted_prior(const voxelslam_offline::PipelineStatus& status,
                                     std::uint64_t target) const {
     return status.odometry_waiting_for_prior &&
@@ -1673,12 +1486,6 @@ class VoxelSlam {
                status.odometry_waiting_prior_end_time);
   }
 
-  // True once every background worker has drained the work the sweeps fed so far.
-  // The order of the tests matters and must not be rearranged: an idle loop thread
-  // is what guarantees no further keyframe can be queued, so the global-bundle-
-  // adjustment thread's drained flag is only meaningful once it has been read after
-  // that. Reading the flag first would admit a keyframe queued and consumed in
-  // between and report both threads idle while a bottom-up pass was still due.
   bool workers_idle() const {
     if (!slam_) {
       return true;
@@ -1692,9 +1499,6 @@ class VoxelSlam {
         return false;
       }
     }
-    // Drained, not merely between passes: the flag is cleared by whoever queues the
-    // work and re-set only when that thread finds its input empty, so a pass that
-    // has not started yet still reads as busy.
     return !options_.enable_global_mapping || slam_->gba_quiescent != 0;
   }
 
@@ -1727,12 +1531,13 @@ class VoxelSlam {
         loop_update_pending = slam_->loop_detect != 0;
         loop_reset_pending = slam_->reset_flag != 0;
       }
-      // Sampled after the loop-thread state, so a caller polling this dict sees the
-      // same ordering workers_idle() relies on.
       gba_idle = finished_ || slam_->gba_quiescent != 0;
     }
 
     return status_to_dict(voxelslam_offline::snapshot_pipeline_status(),
+                          latest_imu_ticket_,
+                          voxelslam_offline::prior_latest_ticket(),
+                          latest_lidar_ticket_,
                           pending_imu,
                           voxelslam_offline::prior_buffer_size(),
                           pending_lidar,
@@ -1789,8 +1594,6 @@ class VoxelSlam {
     node_.setParam<int>("Loop/acsize", o.loop_acsize);
     node_.setParam<int>("Loop/mgsize", o.loop_mgsize);
     node_.setParam<int>("Loop/isHighFly", o.loop_is_high_fly);
-    node_.setParam<double>("Loop/dwell_seconds", o.loop_dwell_seconds);
-
     node_.setParam<double>("GBA/voxel_size", o.gba_voxel_size);
     node_.setParam<double>("GBA/min_eigen_value", o.gba_min_eigen_value);
     node_.setParam<std::vector<double>>("GBA/eigen_value_array", o.gba_eigen_value_array);
@@ -1902,7 +1705,6 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("loop_acsize", &VoxelSlamOptions::loop_acsize)
       .def_readwrite("loop_mgsize", &VoxelSlamOptions::loop_mgsize)
       .def_readwrite("loop_is_high_fly", &VoxelSlamOptions::loop_is_high_fly)
-      .def_readwrite("loop_dwell_seconds", &VoxelSlamOptions::loop_dwell_seconds)
       .def_readwrite("gba_voxel_size", &VoxelSlamOptions::gba_voxel_size)
       .def_readwrite("gba_min_eigen_value", &VoxelSlamOptions::gba_min_eigen_value)
       .def_readwrite("gba_eigen_value_array", &VoxelSlamOptions::gba_eigen_value_array)

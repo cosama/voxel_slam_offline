@@ -50,13 +50,13 @@ config object.
 import numpy as np
 import voxelslam
 
-# VoxelSlamConfig carries upstream Voxel-SLAM parameters and nothing else.
+# Upstream estimator parameters.
 config = voxelslam.VoxelSlamConfig(
     blind=2.8,
     point_filter_num=3,
 )
 
-# p_imu = T_imu_lidar @ p_lidar
+# LiDAR-to-IMU transform.
 lidar_to_imu = np.array([
     [1.0, 0.0, 0.0, -0.114],
     [0.0, -1.0, 0.0, 0.0],
@@ -64,10 +64,7 @@ lidar_to_imu = np.array([
     [0.0, 0.0, 0.0, 1.0],
 ])
 
-# How this process runs the estimator is passed here, not stored in the config:
-# `enable_loop_closure` and `enable_global_mapping` (both default True) suppress
-# upstream's optional threads for odometry-only ablations, and loop closure
-# requires global mapping.
+# Optional worker controls.
 slam = voxelslam.VoxelSlam(
     config,
     lidar_to_imu=lidar_to_imu,
@@ -90,8 +87,8 @@ metrics = result.metrics
 
 For an external odometry prior, construct with `enable_prior=True` and stream
 `push_prior_pose(stamp, position, [qx, qy, qz, qw], covariance)` alongside the
-sensors. Push one prior pose past each scan end; interpolation never
-extrapolates, and the odometry worker parks until that lookahead exists.
+sensors. Push the interpolation bracket and its following pose past each scan
+end. Interpolation never extrapolates, so the worker parks until both exist.
 
 For online-style use, keep one `VoxelSlam` instance alive and do not call
 `finish()` until shutdown:

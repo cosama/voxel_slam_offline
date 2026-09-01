@@ -11,8 +11,7 @@ find_package(PCL REQUIRED COMPONENTS common io kdtree filters registration)
 find_library(GTSAM_LIBRARY NAMES gtsam REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
-# Pinned upstream + auditable patch series
-# Apply checked-in patches to a build-tree copy, leaving the submodule pristine.
+# Patch pinned upstream copy.
 get_filename_component(VOXELSLAM_BRIDGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(UPSTREAM_VOXELSLAM "${VOXELSLAM_BRIDGE_ROOT}/upstream/Voxel-SLAM/VoxelSLAM")
 if(NOT EXISTS "${UPSTREAM_VOXELSLAM}/src/voxelslam.cpp")

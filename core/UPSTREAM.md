@@ -18,12 +18,8 @@ error rather than a fuzzy relocation, making upstream drift explicit. Patch
 files are also registered with `CMAKE_CONFIGURE_DEPENDS`, so editing one
 automatically reruns configuration and recreates the staged tree.
 
-Because patches are grouped by upstream file, every hunk carries its rationale
-at the integration site, tagged `voxelslam_bridge:`. After configuration,
-`grep -rn 'voxelslam_bridge:' build/upstream_staged/` enumerates the complete
-local integration surface in the source that is actually compiled. Each patch
-header provides a numbered concern-level overview; vague or header-only
-rationales are not accepted.
+Patches are grouped by upstream file. Headers state the integration need;
+source comments are kept only when the code cannot express the constraint.
 
 ## Patch series
 
@@ -32,11 +28,11 @@ easy to audit:
 
 | Patch | Upstream file | Purpose |
 |---|---|---|
-| `01-voxelslam-cpp.patch` | `src/voxelslam.cpp` | Captures odometry/map/loop/GBA results; hardens worker flags and ticket lifecycle; fixes gravity alignment, covariance rotation, stale slide-map pointers, and numerical guards; disables ROS subscriptions in Python; gates both output-directory sites on `is_save_map`. |
+| `01-voxelslam-cpp.patch` | `src/voxelslam.cpp` | Captures results, synchronizes workers, and guards shared state. |
 | `02-voxelslam-hpp.patch` | `src/voxelslam.hpp` | Carries LiDAR tickets through locked queues, exposes IMU wait state, preserves validated sweep timing, converts host-process exits to exceptions, and fixes covariance-frame rotation. |
-| `03-voxel-map.patch` | `src/voxel_map.hpp` | Handles sparse residual workloads, guards LM ratios, converts invalid optimizer state to an exception, and fixes temporary-map sentinel comparisons. |
+| `03-voxel-map.patch` | `src/voxel_map.hpp` | Adds prior factors, handles sparse workloads, guards LM ratios, and fixes invalid state and sentinel handling. |
 | `04-loop-refine.patch` | `src/loop_refine.hpp` | Rejects empty ICP inputs and records the exact eigenvalue/convergence verdict. |
-| `05-ekf-imu.patch` | `src/ekf_imu.hpp` | Converts time regression to an exception and uses direction-normalized, fixed-magnitude gravity initialization. |
+| `05-ekf-imu.patch` | `src/ekf_imu.hpp` | Adds prior deskew, converts time regression to an exception, and normalizes gravity initialization. |
 | `06-btc.patch` | `src/BTC.cpp` | Makes descriptor generation and geometric verification defined for empty or underspecified inputs. |
 | `07-feature-point.patch` | `src/feature_point.hpp` | Converts unsupported LiDAR type termination into a catchable configuration error. |
 

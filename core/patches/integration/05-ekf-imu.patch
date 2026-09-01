@@ -1,70 +1,32 @@
-ekf_imu.hpp -- IMU/estimator correctness and host-safe failure behavior.
+ekf_imu.hpp integration patch.
 
-1. Report LiDAR timestamp regression through an exception.
-2. Seed gravity from mean acceleration direction at the known physical
-   magnitude, with a stable fallback, in both initialization and reset paths.
-3. Undistort points against an externally supplied odometry prior instead of IMU
-   dead reckoning, when one is installed and the option is on. Deskew error is
-   baked into the voxel map at insertion, so it is the one sharpening lever that
-   does not touch the estimated trajectory. All of a sweep or none of it: a
-   point the prior cannot place is not half-corrected, it is asserted to be at
-   the sweep-end pose already. Inert unless enabled.
-
-Every hunk has an in-source `voxelslam_bridge:` rationale. The complete file
-delta is generated with `diff -U3` and applied with zero fuzz.
+Guards IMU and supports deskew.
 
 --- src/ekf_imu.hpp
 +++ src/ekf_imu.hpp
-@@ -5,6 +5,11 @@
+@@ -5,6 +5,8 @@
  #include <deque>
  #include <sensor_msgs/Imu.h>
  
-+// voxelslam_bridge: the odometry prior's deskew accessors, used by motion_blur.
-+// Included here rather than relied on from the translation unit's earlier
-+// includes so this header stays self-contained.
 +#include <voxelslam/offline_bridge.hpp>
 +
  class IMUEKF
  {
  public:
-@@ -44,8 +49,8 @@
+@@ -44,8 +46,7 @@
  
      if(last_pcl_end_time - pcl_beg_time > 0.01)
      {
 -      printf("%lf %lf\n", pcl_beg_time, last_pcl_end_time);
 -      printf("LiDAR time regress. Please check data\n"); exit(0);
-+      // voxelslam_bridge: propagate timestamp regression instead of exiting the host.
 +      throw std::runtime_error("LiDAR time regress. Please check data");
      }
  
      imu_poses.clear();
-@@ -135,6 +140,49 @@
+@@ -135,6 +136,26 @@
      if(point_notime)
        return;
  
-+    // voxelslam_bridge: undistort against the odometry prior when one is
-+    // installed. The loop below reconstructs each point's pose by dead reckoning
-+    // the IMU across the sweep, and that error is baked into the voxel map at
-+    // insertion, before local BA ever sees the scan -- so no amount of later
-+    // pose refinement removes it. The prior already carries the continuous
-+    // motion; using it here sharpens every scan without touching the estimated
-+    // trajectory at all.
-+    //
-+    // Both the state propagation above and `xc` are left exactly as upstream
-+    // computed them. Only the per-point compensation changes, and it is the same
-+    // quantity: upstream forms `xc.R^T * R_i` and `xc.R^T * (p_i - xc.p)`, the
-+    // motion from the point's stamp to the sweep end in the sweep-end body
-+    // frame, and that is what `prior_deskew_point` returns. Being a body-frame
-+    // relative, the prior's own world frame cancels, as everywhere else in this
-+    // bridge.
-+    //
-+    // The frame is built only when the prior spans the whole sweep, so this is
-+    // all of the scan or none of it. A point the prior cannot place must not be
-+    // left at its raw coordinates beside undistorted ones: that asserts it was
-+    // already at the sweep-end pose, which is a full sweep of motion error baked
-+    // into the voxel map, and it is worse than the IMU deskew below. The frame
-+    // also copies the sweep's handful of prior samples once, so the per-point
-+    // path takes no lock.
 +    voxelslam_offline::PriorDeskewFrame prior_frame;
 +    if(voxelslam_offline::prior_deskew_enabled() &&
 +       voxelslam_offline::prior_deskew_frame(pcl_beg_time, pcl_end_time, &prior_frame))
@@ -88,17 +50,10 @@ delta is generated with `diff -U3` and applied with zero fuzz.
      auto it_pcl = pcl_in.end() - 1;
      for(int i=imu_poses.size()-1; i>=0; i--)
      {
-@@ -194,6 +242,21 @@
+@@ -194,6 +215,14 @@
      last_imu = imus.back();
    }
  
-+  // voxelslam_bridge: seed gravity from the *direction* of the mean specific force only, rescaled
-+  // to the known gravity magnitude. Using the raw magnitude seeds gravity low
-+  // whenever initialization happens under motion (the mean specific force is
-+  // then not gravity), which biases every subsequent propagation step. The
-+  // normalization also makes the seed independent of the raw acceleration
-+  // units, so `scale_gravity` is deliberately not applied here; it is left
-+  // untouched for the propagation path that needs it.
 +  Eigen::Vector3d normalized_gravity_seed() const
 +  {
 +    const double mean_acc_norm = mean_acc.norm();
@@ -110,12 +65,11 @@ delta is generated with `diff -U3` and applied with zero fuzz.
    int process(IMUST &x_curr, pcl::PointCloud<PointType> &pcl_in, deque<sensor_msgs::Imu::Ptr> &imus)
    {
      if(!init_flag)
-@@ -202,7 +265,8 @@
+@@ -202,7 +231,7 @@
        if(mean_acc.norm() < 2 && imu_topic == "/livox/imu")
          scale_gravity = G_m_s2;
        printf("scale_gravity: %lf %lf %d\n", scale_gravity, mean_acc.norm(), init_num);
 -      x_curr.g = -mean_acc * scale_gravity;
-+      // voxelslam_bridge: initialization and reset share the fixed-magnitude seed.
 +      x_curr.g = normalized_gravity_seed();
        if(init_num > min_init_num) init_flag = true;
        last_pcl_end_time = pcl_end_time;

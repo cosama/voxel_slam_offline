@@ -10,22 +10,7 @@ from ._core import VoxelSlamOptions
 
 @dataclass(slots=True)
 class VoxelSlamConfig:
-    """Upstream Voxel-SLAM parameters, and nothing else.
-
-    Every field here is a parameter upstream's own node reads from its YAML
-    (`n.param("<Section>/<key>", ...)` in `voxelslam.cpp`); the
-    `odom_`/`lba_`/`loop_`/`gba_` prefixes only flatten upstream's sections,
-    which repeat key names.
-
-    Deliberately absent, because upstream would not recognise them: the
-    extrinsic (pass `lidar_to_imu` or `imu_to_lidar` to `VoxelSlam` so
-    calibration has one explicit path), the odometry prior, and offline
-    execution policy -- `emit_deskewed_points`, `enable_loop_closure`,
-    `enable_global_mapping`. Those are decisions about how we run the
-    estimator, so they are `VoxelSlam` constructor arguments driven by runner
-    CLI flags. Runners serialize this object into run manifests; it must stay
-    a faithful record of the upstream configuration alone.
-    """
+    """Upstream Voxel-SLAM parameters."""
 
     blind: float = 2.8
     point_filter_num: int = 3
@@ -61,8 +46,6 @@ class VoxelSlamConfig:
     loop_acsize: int = 2
     loop_mgsize: int = 2
     loop_is_high_fly: int = 0
-    loop_dwell_seconds: float = 0.0
-
     gba_voxel_size: float = 2.0
     gba_min_eigen_value: float = 0.01
     gba_eigen_value_array: list[float] = field(default_factory=lambda: [9.0, 9.0, 9.0, 9.0])

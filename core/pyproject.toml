@@ -17,8 +17,7 @@ classifiers = [
 cmake.build-type = "Release"
 wheel.packages = ["python/voxelslam"]
 
-# Invalidate uv's local native wheel whenever the bridge, staged patch series,
-# build definition, or pinned submodule revision changes.
+# Track native inputs.
 [tool.uv]
 cache-keys = [
   { file = "pyproject.toml" },

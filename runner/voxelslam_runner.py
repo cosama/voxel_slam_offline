@@ -24,7 +24,6 @@ from voxelslam import (
 
 PROGRESS_INTERVAL = 100
 TRAJECTORY_FRAME_ID = "map"
-TRAJECTORY_CHILD_FRAME_ID = "base_link"
 
 
 @dataclass(slots=True)
@@ -37,11 +36,6 @@ class RunnerConfig:
     stamp_is_end: bool = False
     dense_ply: bool = False
     dense_memory_limit_gb: float = 4.0
-    # Execution policy, not upstream configuration: upstream always starts both
-    # optional threads. Disabling them gives an odometry-only ablation; loop
-    # closure requires global mapping.
-    enable_loop_closure: bool = True
-    enable_global_mapping: bool = True
 
 
 @dataclass(slots=True)
@@ -97,10 +91,7 @@ def run_bag(
     slam = VoxelSlam(
         slam_config,
         lidar_to_imu=lidar_to_imu,
-        # The dense-map tap is on exactly when this run writes map.ply.
         emit_deskewed_points=runner_config.dense_ply,
-        enable_loop_closure=runner_config.enable_loop_closure,
-        enable_global_mapping=runner_config.enable_global_mapping,
     )
 
     pointcloud_ply = output_dir / "map.ply" if runner_config.dense_ply else None
@@ -140,23 +131,24 @@ def run_bag(
                     )
                     if points.size == 0:
                         continue
-                    lidar_count += push_sweep(
-                        slam,
-                        dense_map,
+                    ticket = slam.push_lidar(
                         stamp,
                         points,
                         times,
                         intensities,
-                        stamp_is_end=runner_config.stamp_is_end,
                         scan_duration=runner_config.scan_duration,
+                        stamp_is_end=runner_config.stamp_is_end,
                     )
+                    # Preserve deterministic replay.
+                    slam.synchronize(ticket)
+                    if dense_map is not None:
+                        dense_map.drain_from(slam)
+                    lidar_count += 1
                     report_progress(dense_map, imu_count, lidar_count, start_time)
 
         result = slam.finish()
         pipeline_status = slam.status()
-        # Sweeps the estimator could never cover with the recorded data --
-        # typically the tail of a bag that ends without trailing IMU. A property
-        # of the recording, so it is reported, never fatal.
+        # Report uncovered tail.
         unprocessed_tail_sweeps = int(pipeline_status["lidar"]["uncovered"])
         if unprocessed_tail_sweeps:
             print(
@@ -174,7 +166,7 @@ def run_bag(
             trajectory_csv,
             result.trajectory,
             frame_id=TRAJECTORY_FRAME_ID,
-            child_frame_id=TRAJECTORY_CHILD_FRAME_ID,
+            child_frame_id=info.imu_frame,
         )
         if pointcloud_ply is not None and dense_map is not None:
             dense_map.write_ply(pointcloud_ply, result.trajectory, lidar_to_imu)
@@ -182,6 +174,7 @@ def run_bag(
     finally:
         if dense_map is not None:
             dense_map.close()
+            dense_map.remove()
 
     summary = {
         "bag": str(bag),
@@ -203,8 +196,8 @@ def run_bag(
         "pipeline": pipeline_status,
         "execution": {
             "emit_deskewed_points": runner_config.dense_ply,
-            "enable_loop_closure": runner_config.enable_loop_closure,
-            "enable_global_mapping": runner_config.enable_global_mapping,
+            "enable_loop_closure": True,
+            "enable_global_mapping": True,
         },
     }
     manifest = output_dir / "manifest.json"
@@ -213,50 +206,13 @@ def run_bag(
     return summary
 
 
-def push_sweep(
-    slam: VoxelSlam,
-    dense_map: "DenseMapBuffer | None",
-    stamp: float,
-    points,
-    times,
-    intensities,
-    *,
-    stamp_is_end: bool,
-    scan_duration: float,
-) -> int:
-    """Feed one sweep and let the estimator make whatever progress it can.
-
-    The runner does not inspect IMU coverage and does not decide which sweeps
-    are feedable: whether a sweep can be deskewed is the estimator's business,
-    and it reports the shortfall through `status()`. Feeding every sweep is what
-    keeps call order irrelevant here.
-    """
-
-    ticket = slam.push_lidar(
-        stamp,
-        points,
-        times,
-        intensities,
-        scan_duration=scan_duration,
-        stamp_is_end=stamp_is_end,
-    )
-    # Offline replay is back-pressured, not wall-clock limited: this blocks
-    # until the workers have made all the progress the data submitted so far
-    # allows, which is what makes the replay deterministic. It cannot be
-    # bounded or skipped.
-    slam.synchronize(ticket)
-    if dense_map is not None:
-        dense_map.drain_from(slam)
-    return 1
-
-
 def report_progress(
     dense_map: "DenseMapBuffer | None",
     imu_count: int,
     lidar_count: int,
     start_time: float,
 ) -> None:
-    if lidar_count <= 0 or PROGRESS_INTERVAL <= 0 or lidar_count % PROGRESS_INTERVAL != 0:
+    if lidar_count <= 0 or lidar_count % PROGRESS_INTERVAL != 0:
         return
     elapsed = time.monotonic() - start_time
     dense = ""
