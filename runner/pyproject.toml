@@ -10,6 +10,7 @@ license = { text = "GPL-2.0-only" }
 requires-python = ">=3.10"
 dependencies = [
     "rosbags>=0.10",
+    "ruamel.yaml",
     "voxel-slam-offline>=0.1.0",
 ]
 classifiers = [

@@ -53,7 +53,7 @@ context is therefore rejected as upstream drift rather than accepted with fuzz.
 -    double rnorm = rotvec.norm();
 -    rotvec = rotvec / rnorm;
 +    // voxelslam_bridge: FromTwoVectors handles aligned/antiparallel gravity without dividing by zero.
-+    Eigen::Matrix3d rot = Eigen::Quaterniond::FromTwoVectors(n0, Eigen::Vector3d(0, 0, 1)).toRotationMatrix();
++    Eigen::Matrix3d rot = Eigen::Quaterniond::FromTwoVectors(n0, Eigen::Vector3d(0, 0, -1)).toRotationMatrix();
  
 -    Eigen::AngleAxisd angaxis(asin(rnorm), rotvec);
 -    Eigen::Matrix3d rot = angaxis.matrix();

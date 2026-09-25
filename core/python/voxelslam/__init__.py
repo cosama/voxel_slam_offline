@@ -71,7 +71,12 @@ class VoxelSlam:
         )
 
     def finish(self, timeout_seconds: float = 30.0) -> Result:
-        return self._core.finish(timeout_seconds)
+        try:
+            return self._core.finish(timeout_seconds)
+        except RuntimeError:
+            if self._core.is_finished():
+                return self._core.finish(0.0)
+            raise
 
     def request_finish(self) -> None:
         self._core.request_finish()

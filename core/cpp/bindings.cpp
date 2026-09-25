@@ -846,6 +846,11 @@ class VoxelSlam {
       if (status.latest_lidar_processed_ticket >= target && loop_closure_idle()) {
         return;
       }
+      if (status.odometry_waiting_for_imu &&
+          status.odometry_waiting_lidar_ticket >= target &&
+          loop_closure_idle()) {
+        return;
+      }
       if (has_timeout && std::chrono::steady_clock::now() - start > timeout) {
         throw std::runtime_error("timed out waiting for VoxelSLAM lidar processing and loop closure idle");
       }
